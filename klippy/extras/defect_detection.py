@@ -240,7 +240,7 @@ class DefectDetection:
 
         else:
             self.reset_check_data()
-            self.config = copy.deepcopy(tmp_config)
+            self.config = tmp_config
             if not self.printer.update_snapmaker_config_file(self.config_path, self.config, DEFAULT_CONFIG):
                 logging.error("[defect_detection] config save failed")
 
@@ -428,6 +428,9 @@ class DefectDetection:
 
             logging.info(f"[defect_detection] response info: {respond_info}")
 
+            if self.print_stats.state != 'printing':
+                return
+
             result = respond_info.get("result", None)
             if result == None:
                 logging.error(f"[defect_detection] request failed")
@@ -604,7 +607,7 @@ class DefectDetection:
                     level = 2)
 
     def get_status(self, eventtime=None):
-        return copy.deepcopy(self.config)
+        return self.config
 
     def cmd_DEFECT_DETECTION_CONFIG(self, gcmd):
         main_enable = gcmd.get_int('MAIN_ENABLE', None)
@@ -676,7 +679,7 @@ class DefectDetection:
 
         else:
             self.reset_check_data()
-            self.config = copy.deepcopy(tmp_config)
+            self.config = tmp_config
             if not self.printer.update_snapmaker_config_file(self.config_path, self.config, DEFAULT_CONFIG):
                 logging.error("[defect_detection] config save failed")
 
@@ -804,7 +807,7 @@ class DefectDetection:
                     pos_1 = list(toolhead.get_position())
                     if start_pos[2] - pos_1[2] < self.bed_detect_probe_distance - 0.2:
                         current_pos = list(toolhead.get_position())
-                        toolhead.manual_move([None, None, current_pos[2] + 2], 30)
+                        toolhead.manual_move([None, None, min(current_pos[2] + 2, start_pos[2])], 30)
                         toolhead.wait_moves()
                         self.gcode.run_script_from_command(f"PROBE SAMPLE_TRIG_FREQ=450 SAMPLES=1 PROBE_SPEED=5 SAMPLE_DIST_Z={self.bed_detect_probe_distance}")
                         toolhead.wait_moves()

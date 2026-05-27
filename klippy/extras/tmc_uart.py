@@ -70,12 +70,12 @@ def lookup_tmc_uart_mutex(mcu):
         pmutexes.mcu_to_mutex[mcu] = mutex
     return mutex
 
-TMC_BAUD_RATE = 9600
+TMC_BAUD_RATE = 40000
 TMC_BAUD_RATE_AVR = 9000
 
 # Code for sending messages on a TMC uart
 class MCU_TMC_uart_bitbang:
-    def __init__(self, rx_pin_params, tx_pin_params, select_pins_desc):
+    def __init__(self, rx_pin_params, tx_pin_params, select_pins_desc, baud_rate=None):
         self.mcu = rx_pin_params['chip']
         self.mutex = lookup_tmc_uart_mutex(self.mcu)
         self.pullup = rx_pin_params['pullup']
@@ -84,6 +84,7 @@ class MCU_TMC_uart_bitbang:
         self.oid = self.mcu.create_oid()
         self.cmd_queue = self.mcu.alloc_command_queue()
         self.analog_mux = None
+        self.baud_rate = baud_rate
         if select_pins_desc is not None:
             self.analog_mux = MCU_analog_mux(self.mcu, self.cmd_queue,
                                              select_pins_desc)
@@ -91,10 +92,13 @@ class MCU_TMC_uart_bitbang:
         self.tmcuart_send_cmd = None
         self.mcu.register_config_callback(self.build_config)
     def build_config(self):
-        baud = TMC_BAUD_RATE
-        mcu_type = self.mcu.get_constants().get("MCU", "")
-        if mcu_type.startswith("atmega") or mcu_type.startswith("at90usb"):
-            baud = TMC_BAUD_RATE_AVR
+        if self.baud_rate is not None:
+            baud = self.baud_rate
+        else:
+            baud = TMC_BAUD_RATE
+            mcu_type = self.mcu.get_constants().get("MCU", "")
+            if mcu_type.startswith("atmega") or mcu_type.startswith("at90usb"):
+                baud = TMC_BAUD_RATE_AVR
         bit_ticks = self.mcu.seconds_to_clock(1. / baud)
         self.mcu.add_config_cmd(
             "config_tmcuart oid=%d rx_pin=%s pull_up=%d tx_pin=%s bit_time=%d"
@@ -190,6 +194,7 @@ def lookup_tmc_uart_bitbang(config, max_addr):
     ppins = config.get_printer().lookup_object("pins")
     rx_pin_params = ppins.lookup_pin(config.get('uart_pin'), can_pullup=True,
                                      share_type="tmc_uart_rx")
+    uart_baud_rate = config.getint('uart_baud_rate', None)
     tx_pin_desc = config.get('tx_pin', None)
     if tx_pin_desc is None:
         tx_pin_params = rx_pin_params
@@ -203,7 +208,7 @@ def lookup_tmc_uart_bitbang(config, max_addr):
     mcu_uart = rx_pin_params.get('class')
     if mcu_uart is None:
         mcu_uart = MCU_TMC_uart_bitbang(rx_pin_params, tx_pin_params,
-                                        select_pins_desc)
+                                        select_pins_desc, uart_baud_rate)
         rx_pin_params['class'] = mcu_uart
     instance_id = mcu_uart.register_instance(rx_pin_params, tx_pin_params,
                                              select_pins_desc, addr)

@@ -47,6 +47,8 @@ DEFAULT_PRINT_TASK_CONFIG = {
     'replenish_ignore_color' : False,
     'filament_entangle_detect': False,
     'filament_entangle_sen': ENTANGLE_SENSITIVITY_MEDIUM,
+    'end_led_turn_off': False,
+    'end_unload_filament': [False] * PHYSICAL_EXTRUDER_NUM,
     'reprint_info': {
         'auto_bed_leveling': False,
         'flow_calibrate': False,
@@ -54,6 +56,7 @@ DEFAULT_PRINT_TASK_CONFIG = {
         'time_lapse_camera': False,
         'extruder_map_table': [i for i in range(PHYSICAL_EXTRUDER_NUM)] + [0] * (LOGICAL_EXTRUDER_NUM - PHYSICAL_EXTRUDER_NUM),
         'extruders_used' : [False] * PHYSICAL_EXTRUDER_NUM,
+        'end_unload_filament': [False] * PHYSICAL_EXTRUDER_NUM,
     }
 }
 
@@ -89,6 +92,7 @@ class PrintTaskConfig:
             'filament_color_multi': [{}] * PHYSICAL_EXTRUDER_NUM,
         }
         self.perform_auto_replenish = False
+        self.is_exec_print_end_action = False
 
         config_dir = self.printer.get_snapmaker_config_dir()
         config_name = PRINT_TASK_CONFIG_FILE
@@ -129,15 +133,18 @@ class PrintTaskConfig:
             "INNER_AUTO_REPLENISH_FILAMENT", self.cmd_INNER_AUTO_REPLENISH_FILAMENT)
         self.gcode.register_command(
             "SET_PRINT_TASK_PARAMETERS", self.cmd_SET_PRINT_TASK_PARAMETERS)
+        self.gcode.register_command(
+            "INNER_PRINT_END", self.cmd_INNER_PRINT_END)
 
         webhooks = self.printer.lookup_object('webhooks')
         webhooks.register_endpoint("print_task_config/set_print_preferences",
                                    self._handle_set_print_preferences)
         self.printer.register_event_handler("klippy:ready", self._ready)
+        self.printer.register_event_handler("filament_feed:port", self._feed_port_evt_handle)
+        self.printer.register_event_handler("filament_switch_sensor:runout", self._runout_evt_handle)
 
     def _handle_set_print_preferences(self, web_request):
-        need_save = False
-        old_print_task_config = copy.deepcopy(self.print_task_config)
+        tmp_print_task_config = copy.deepcopy(self.print_task_config)
 
         try:
             logging.info(f"[print_task_config] wb, set_print_preferences: {web_request.get_raw_parameters()}")
@@ -146,66 +153,70 @@ class PrintTaskConfig:
             filament_entangle_detect = web_request.get_int('filament_entangle_detect', None)
             filament_entangle_sen = web_request.get_str('filament_entangle_sen', None)
             auto_replenish_ignore_color = web_request.get_int('replenish_ignore_color', None)
+            end_led_turn_off = web_request.get_int('end_led_turn_off', None)
 
             if auto_replenish_filament is not None:
-                self.print_task_config['auto_replenish_filament'] = bool(auto_replenish_filament)
+                tmp_print_task_config['auto_replenish_filament'] = bool(auto_replenish_filament)
 
             if auto_replenish_ignore_color is not None:
-                self.print_task_config['replenish_ignore_color'] = bool(auto_replenish_ignore_color)
+                tmp_print_task_config['replenish_ignore_color'] = bool(auto_replenish_ignore_color)
 
             if filament_entangle_detect is not None:
-                self.print_task_config['filament_entangle_detect'] = bool(filament_entangle_detect)
+                tmp_print_task_config['filament_entangle_detect'] = bool(filament_entangle_detect)
 
             if filament_entangle_sen is not None:
                 if filament_entangle_sen not in [ENTANGLE_SENSITIVITY_LOW, ENTANGLE_SENSITIVITY_MEDIUM, ENTANGLE_SENSITIVITY_HIGH]:
                     raise ValueError(f"filament_entangle_sen error: {filament_entangle_sen}")
-                self.print_task_config['filament_entangle_sen'] = filament_entangle_sen
+                tmp_print_task_config['filament_entangle_sen'] = filament_entangle_sen
 
             if filament_entangle_detect is not None or filament_entangle_sen is not None:
-                self.printer.send_event("print_task_config:set_entangle_detect", self.print_task_config['filament_entangle_detect'])
+                self.printer.send_event("print_task_config:set_entangle_detect", tmp_print_task_config['filament_entangle_detect'])
 
-            need_save = True
+            if end_led_turn_off is not None:
+                tmp_print_task_config['end_led_turn_off'] = bool(end_led_turn_off)
+
+            self.print_task_config = tmp_print_task_config
+            if not self.printer.update_snapmaker_config_file(self.config_path,
+                        self.print_task_config, DEFAULT_PRINT_TASK_CONFIG):
+                logging.error("[print_task_config] save print_task_config failed\r\n")
+
             web_request.send({'state': 'success'})
 
         except Exception as e:
             logging.error("[print_task_config] set_print_preferences: %s", str(e))
-            self.print_task_config = old_print_task_config
             web_request.send({'state': 'error', 'message': str(e)})
-
-        finally:
-            if need_save:
-                if not self.printer.update_snapmaker_config_file(self.config_path,
-                            self.print_task_config, DEFAULT_PRINT_TASK_CONFIG):
-                    logging.error("[print_task_config] save print_task_config failed\r\n")
 
     def _early_check(self):
         need_save = False
+        tmp_print_task_config = copy.deepcopy(self.print_task_config)
         try:
             ###################################################################
             ##################### simple check ################################
-            if len(self.print_task_config['filament_vendor']) != PHYSICAL_EXTRUDER_NUM or \
-                    len(self.print_task_config['filament_type']) != PHYSICAL_EXTRUDER_NUM or \
-                    len(self.print_task_config['filament_sub_type']) != PHYSICAL_EXTRUDER_NUM or \
-                    len(self.print_task_config['filament_color']) != PHYSICAL_EXTRUDER_NUM or \
-                    len(self.print_task_config['filament_color_rgba']) != PHYSICAL_EXTRUDER_NUM or \
-                    len(self.print_task_config['filament_color_multi']) != PHYSICAL_EXTRUDER_NUM or \
-                    len(self.print_task_config['filament_official']) != PHYSICAL_EXTRUDER_NUM or \
-                    len(self.print_task_config['filament_sku']) != PHYSICAL_EXTRUDER_NUM or \
-                    len(self.print_task_config['filament_edit']) != PHYSICAL_EXTRUDER_NUM or \
-                    len(self.print_task_config['filament_exist']) != PHYSICAL_EXTRUDER_NUM or \
-                    len(self.print_task_config['filament_soft']) != PHYSICAL_EXTRUDER_NUM or \
-                    len(self.print_task_config['extruders_used']) != PHYSICAL_EXTRUDER_NUM or \
-                    len(self.print_task_config['extruders_replenished']) != PHYSICAL_EXTRUDER_NUM or \
-                    len(self.print_task_config['flow_calib_extruders']) != PHYSICAL_EXTRUDER_NUM:
+            if len(tmp_print_task_config['filament_vendor']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['filament_type']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['filament_sub_type']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['filament_color']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['filament_color_rgba']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['filament_color_multi']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['filament_official']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['filament_sku']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['filament_edit']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['filament_exist']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['filament_soft']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['extruders_used']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['extruders_replenished']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['end_unload_filament']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['flow_calib_extruders']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['extruder_map_table']) != LOGICAL_EXTRUDER_NUM:
                 raise ValueError(f"print_task_config invalid")
 
             for i in range(PHYSICAL_EXTRUDER_NUM):
-                if not isinstance(self.print_task_config['filament_color_rgba'][i], str) or \
-                                len(self.print_task_config['filament_color_rgba'][i]) != 8:
+                if not isinstance(tmp_print_task_config['filament_color_rgba'][i], str) or \
+                                len(tmp_print_task_config['filament_color_rgba'][i]) != 8:
                     raise ValueError(f"print_task_config invalid")
-                for j in range(self.print_task_config['filament_color_multi'][i]['nums']):
-                    if not isinstance(self.print_task_config['filament_color_multi'][i]['colors'][j], str) or \
-                                len(self.print_task_config['filament_color_multi'][i]['colors'][j]) != 6:
+                for j in range(tmp_print_task_config['filament_color_multi'][i]['nums']):
+                    if not isinstance(tmp_print_task_config['filament_color_multi'][i]['colors'][j], str) or \
+                                len(tmp_print_task_config['filament_color_multi'][i]['colors'][j]) != 6:
                         raise ValueError(f"print_task_config invalid")
 
             ###################################################################
@@ -213,26 +224,35 @@ class PrintTaskConfig:
             ###################################################################
             ################## compatiable with old version ###################
             for i in range(PHYSICAL_EXTRUDER_NUM):
-                if isinstance(self.print_task_config['filament_color'][i], str):
-                    self.print_task_config['filament_color'] = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG['filament_color'])
-                    self.print_task_config['filament_color_rgba'] = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG['filament_color_rgba'])
-                    need_save = True
-                    break
+                if isinstance(tmp_print_task_config['filament_color'][i], str):
+                    raise ValueError(f"print_task_config invalid")
 
             for i in range(PHYSICAL_EXTRUDER_NUM):
-                if self.print_task_config['filament_color_rgba'][i][0:6] != self.print_task_config['filament_color_multi'][i]['colors'][0]:
-                    rgb = self.print_task_config['filament_color_rgba'][i][0:6]
-                    alpha = int(self.print_task_config['filament_color_rgba'][i][6:8], 16)
+                if tmp_print_task_config['filament_color_rgba'][i][0:6] != tmp_print_task_config['filament_color_multi'][i]['colors'][0]:
+                    rgb = tmp_print_task_config['filament_color_rgba'][i][0:6]
+                    alpha = int(tmp_print_task_config['filament_color_rgba'][i][6:8], 16)
                     color_multi = {
                         'nums': 1,
                         'alpha': alpha,
                         'mode': 0,
                         'colors': [rgb]
                     }
-                    self.print_task_config['filament_official'][i] = False
-                    self.print_task_config['filament_color_multi'][i] = color_multi
+                    tmp_print_task_config['filament_official'][i] = False
+                    tmp_print_task_config['filament_color_multi'][i] = color_multi
                     need_save = True
             ###################################################################
+
+            if 'auto_bed_leveling' not in tmp_print_task_config['reprint_info'] or \
+                    'flow_calibrate' not in tmp_print_task_config['reprint_info'] or \
+                    'flow_calib_extruders' not in tmp_print_task_config['reprint_info'] or \
+                    'time_lapse_camera' not in tmp_print_task_config['reprint_info'] or \
+                    'extruder_map_table' not in tmp_print_task_config['reprint_info'] or \
+                    'extruders_used' not in tmp_print_task_config['reprint_info'] or \
+                    'end_unload_filament' not in tmp_print_task_config['reprint_info']:
+                tmp_print_task_config['reprint_info'] = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG['reprint_info'])
+                need_save = True
+
+            self.print_task_config = tmp_print_task_config
 
         except Exception as e:
             logging.error("[print_task_config] _early_check err: %s", str(e))
@@ -253,6 +273,13 @@ class PrintTaskConfig:
             self.filament_dt_obj.register_cb_2_update_filament_info(self._rfid_filament_info_update_cb)
 
         self.backup_filament_info()
+        self.update_filament_flags()
+
+    def _feed_port_evt_handle(self, channel, detect):
+        self.update_filament_flags()
+
+    def _runout_evt_handle(self, extruder, present):
+        self.update_filament_flags()
 
     def _reset_print_task_config(self):
         self.print_task_config = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG)
@@ -302,40 +329,49 @@ class PrintTaskConfig:
                 info['OFFICIAL'] == True:
             return
 
-        filament_color_rgba = f"{info['RGB_1']:06X}" + f"{info['ALPHA']:02X}"
+        tmp_print_task_config = copy.deepcopy(self.print_task_config)
+        try:
+            filament_color_rgba = f"{info['RGB_1']:06X}" + f"{info['ALPHA']:02X}"
 
-        self.print_task_config['filament_vendor'][channel] = info['VENDOR']
-        self.print_task_config['filament_type'][channel] = info['MAIN_TYPE']
-        self.print_task_config['filament_sub_type'][channel] = info['SUB_TYPE']
-        self.print_task_config['filament_color'][channel] = info['ARGB_COLOR']
-        self.print_task_config['filament_color_rgba'][channel] = filament_color_rgba
+            tmp_print_task_config['filament_vendor'][channel] = info['VENDOR']
+            tmp_print_task_config['filament_type'][channel] = info['MAIN_TYPE']
+            tmp_print_task_config['filament_sub_type'][channel] = info['SUB_TYPE']
+            tmp_print_task_config['filament_color'][channel] = info['ARGB_COLOR']
+            tmp_print_task_config['filament_color_rgba'][channel] = filament_color_rgba
 
-        color_multi = {
-            'nums': info['COLOR_NUMS'],
-            'alpha': info['ALPHA'],
-            'mode': info['MULTI_MODE'],
-            'colors':[f"{info['RGB_1']:06X}", f"{info['RGB_2']:06X}", f"{info['RGB_3']:06X}",
-                      f"{info['RGB_4']:06X}", f"{info['RGB_5']:06X}"]
-        }
-        color_multi['colors'] = color_multi['colors'][:color_multi['nums']]
-        self.print_task_config['filament_color_multi'][channel] = color_multi
+            color_multi = {
+                'nums': info['COLOR_NUMS'],
+                'alpha': info['ALPHA'],
+                'mode': info['MULTI_MODE'],
+                'colors':[f"{info['RGB_1']:06X}", f"{info['RGB_2']:06X}", f"{info['RGB_3']:06X}",
+                        f"{info['RGB_4']:06X}", f"{info['RGB_5']:06X}"]
+            }
+            color_multi['colors'] = color_multi['colors'][:color_multi['nums']]
+            tmp_print_task_config['filament_color_multi'][channel] = color_multi
 
-        self.print_task_config['filament_official'][channel] = info['OFFICIAL']
-        self.print_task_config['filament_sku'][channel] = info['SKU']
-        if self.filament_param_obj is not None:
-            self.print_task_config['filament_soft'][channel] = \
-                self.filament_param_obj.get_is_soft(info['VENDOR'], info['MAIN_TYPE'], info['SUB_TYPE'])
-        else:
-            self.print_task_config['filament_soft'][channel] = False
-        if info['OFFICIAL'] == True:
-            logging.info(f"[print_task_config] rfid info: {info['VENDOR']} {info['MAIN_TYPE']} {info['SUB_TYPE']} {filament_color_rgba}")
+            tmp_print_task_config['filament_official'][channel] = info['OFFICIAL']
+            tmp_print_task_config['filament_sku'][channel] = info['SKU']
+            if self.filament_param_obj is not None:
+                tmp_print_task_config['filament_soft'][channel] = \
+                    self.filament_param_obj.get_is_soft(info['VENDOR'], info['MAIN_TYPE'], info['SUB_TYPE'])
+            else:
+                tmp_print_task_config['filament_soft'][channel] = False
+
+            self.print_task_config = tmp_print_task_config
+            if not self.printer.update_snapmaker_config_file(self.config_path,
+                    self.print_task_config, DEFAULT_PRINT_TASK_CONFIG):
+                logging.error("[print_task_config] save print_task_config failed\r\n")
+
+            if info['OFFICIAL'] == True:
+                logging.info(f"[print_task_config] rfid info: {info['VENDOR']} {info['MAIN_TYPE']} {info['SUB_TYPE']} {color_multi}")
+
+        except Exception as e:
+            logging.error(f"[print_task_config] rfid info error: {str(e)}")
+
+        self.update_filament_flags()
 
         # do not use run_script_from_command api
         self.gcode.run_script(f"FLOW_RESET_K EXTRUDER={channel}\r\n")
-
-        if not self.printer.update_snapmaker_config_file(self.config_path,
-                self.print_task_config, DEFAULT_PRINT_TASK_CONFIG):
-            logging.error("[print_task_config] save print_task_config failed\r\n")
 
     def get_extruder_map_table(self):
         return self.print_task_config['extruder_map_table']
@@ -349,29 +385,33 @@ class PrintTaskConfig:
     def reset_print_info(self):
         try:
             logging.info("[print_task_config] reset print info")
+            self.is_exec_print_end_action = False
             self.print_task_config_2 = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG_2)
-            self.print_task_config['extruder_map_table'] = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG['extruder_map_table'])
-            self.print_task_config['extruders_used'] = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG['extruders_used'])
-            self.print_task_config['extruders_replenished'] = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG['extruders_replenished'])
-            self.print_task_config['flow_calibrate'] = False
-            self.print_task_config['flow_calib_extruders'] = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG['flow_calib_extruders'])
-            self.print_task_config['auto_bed_leveling'] = False
-            self.print_task_config['time_lapse_camera'] = False
+            tmp_print_task_config = copy.deepcopy(self.print_task_config)
+            tmp_print_task_config['extruder_map_table'] = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG['extruder_map_table'])
+            tmp_print_task_config['extruders_used'] = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG['extruders_used'])
+            tmp_print_task_config['extruders_replenished'] = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG['extruders_replenished'])
+            tmp_print_task_config['flow_calibrate'] = False
+            tmp_print_task_config['flow_calib_extruders'] = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG['flow_calib_extruders'])
+            tmp_print_task_config['auto_bed_leveling'] = False
+            tmp_print_task_config['time_lapse_camera'] = False
+            tmp_print_task_config['end_unload_filament'] = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG['end_unload_filament'])
             # Compatible with old firmware versions
-            if 'reprint_info' not in self.print_task_config or \
-                    'auto_bed_leveling' not in self.print_task_config['reprint_info'] or \
-                    'flow_calibrate' not in self.print_task_config['reprint_info'] or \
-                    'flow_calib_extruders' not in self.print_task_config['reprint_info'] or \
-                    'time_lapse_camera' not in self.print_task_config['reprint_info'] or \
-                    'extruder_map_table' not in self.print_task_config['reprint_info'] or \
-                    'extruders_used' not in self.print_task_config['reprint_info'] or \
-                    len(self.print_task_config['reprint_info']['flow_calib_extruders']) != PHYSICAL_EXTRUDER_NUM or \
-                    len(self.print_task_config['reprint_info']['extruder_map_table']) != LOGICAL_EXTRUDER_NUM or \
-                    len(self.print_task_config['reprint_info']['extruders_used']) != PHYSICAL_EXTRUDER_NUM:
-                self.print_task_config['auto_replenish_filament'] = DEFAULT_PRINT_TASK_CONFIG['auto_replenish_filament']
-                if self.print_task_config['filament_entangle_sen'] == ENTANGLE_SENSITIVITY_LOW:
-                    self.print_task_config['filament_entangle_sen'] = ENTANGLE_SENSITIVITY_MEDIUM
-                self.print_task_config['reprint_info'] = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG['reprint_info'])
+            if 'reprint_info' not in tmp_print_task_config or \
+                    'auto_bed_leveling' not in tmp_print_task_config['reprint_info'] or \
+                    'flow_calibrate' not in tmp_print_task_config['reprint_info'] or \
+                    'flow_calib_extruders' not in tmp_print_task_config['reprint_info'] or \
+                    'time_lapse_camera' not in tmp_print_task_config['reprint_info'] or \
+                    'extruder_map_table' not in tmp_print_task_config['reprint_info'] or \
+                    'extruders_used' not in tmp_print_task_config['reprint_info'] or \
+                    len(tmp_print_task_config['reprint_info']['flow_calib_extruders']) != PHYSICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['reprint_info']['extruder_map_table']) != LOGICAL_EXTRUDER_NUM or \
+                    len(tmp_print_task_config['reprint_info']['extruders_used']) != PHYSICAL_EXTRUDER_NUM:
+                tmp_print_task_config['auto_replenish_filament'] = DEFAULT_PRINT_TASK_CONFIG['auto_replenish_filament']
+                if tmp_print_task_config['filament_entangle_sen'] == ENTANGLE_SENSITIVITY_LOW:
+                    tmp_print_task_config['filament_entangle_sen'] = ENTANGLE_SENSITIVITY_MEDIUM
+                tmp_print_task_config['reprint_info'] = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG['reprint_info'])
+            self.print_task_config = tmp_print_task_config
         except Exception as e:
             logging.error("[print_task_config] reset print info failed: %s", str(e))
             self.print_task_config = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG)
@@ -385,13 +425,14 @@ class PrintTaskConfig:
                 logging.error("[print_task_config] save print_task_config_2 failed\r\n")
 
     def apply_reprint_info(self):
-        logging.info("[print_task_config] set reprint info")
-        self.print_task_config['extruder_map_table'] = copy.deepcopy(self.print_task_config['reprint_info']['extruder_map_table'])
-        self.print_task_config['extruders_used'] = copy.deepcopy(self.print_task_config['reprint_info']['extruders_used'])
-        self.print_task_config['time_lapse_camera'] = copy.deepcopy(self.print_task_config['reprint_info']['time_lapse_camera'])
-        self.print_task_config['flow_calibrate'] = copy.deepcopy(self.print_task_config['reprint_info']['flow_calibrate'])
-        self.print_task_config['flow_calib_extruders'] = copy.deepcopy(self.print_task_config['reprint_info']['flow_calib_extruders'])
-        self.print_task_config['auto_bed_leveling'] = copy.deepcopy(self.print_task_config['reprint_info']['auto_bed_leveling'])
+        logging.info("[print_task_config] apply reprint info")
+        self.print_task_config['extruder_map_table'] = list(self.print_task_config['reprint_info']['extruder_map_table'])
+        self.print_task_config['extruders_used'] = list(self.print_task_config['reprint_info']['extruders_used'])
+        self.print_task_config['time_lapse_camera'] = self.print_task_config['reprint_info']['time_lapse_camera']
+        self.print_task_config['flow_calibrate'] = self.print_task_config['reprint_info']['flow_calibrate']
+        self.print_task_config['flow_calib_extruders'] = list(self.print_task_config['reprint_info']['flow_calib_extruders'])
+        self.print_task_config['auto_bed_leveling'] = self.print_task_config['reprint_info']['auto_bed_leveling']
+        self.print_task_config['end_unload_filament'] = list(self.print_task_config['reprint_info']['end_unload_filament'])
         if not self.printer.update_snapmaker_config_file(self.config_path,
                 self.print_task_config, DEFAULT_PRINT_TASK_CONFIG):
             logging.error("[print_task_config] save print_task_config failed\r\n")
@@ -399,28 +440,34 @@ class PrintTaskConfig:
     def set_reprint_info(self):
         logging.info("[print_task_config] set reprint info")
         try:
-            self.print_task_config['reprint_info']['extruder_map_table'] = copy.deepcopy(self.print_task_config['extruder_map_table'])
-            self.print_task_config['reprint_info']['extruders_used'] = copy.deepcopy(self.print_task_config['extruders_used'])
-            self.print_task_config['reprint_info']['time_lapse_camera'] = self.print_task_config['time_lapse_camera']
-            self.print_task_config['reprint_info']['flow_calibrate'] = self.print_task_config['flow_calibrate']
-            self.print_task_config['reprint_info']['flow_calib_extruders'] = copy.deepcopy(self.print_task_config['flow_calib_extruders'])
-            self.print_task_config['reprint_info']['auto_bed_leveling'] = self.print_task_config['auto_bed_leveling']
+            tmp_reprint_info = copy.deepcopy(self.print_task_config['reprint_info'])
+            tmp_reprint_info['extruder_map_table'] = list(self.print_task_config['extruder_map_table'])
+            tmp_reprint_info['extruders_used'] = list(self.print_task_config['extruders_used'])
+            tmp_reprint_info['time_lapse_camera'] = self.print_task_config['time_lapse_camera']
+            tmp_reprint_info['flow_calibrate'] = self.print_task_config['flow_calibrate']
+            tmp_reprint_info['flow_calib_extruders'] = list(self.print_task_config['flow_calib_extruders'])
+            tmp_reprint_info['auto_bed_leveling'] = self.print_task_config['auto_bed_leveling']
+            tmp_reprint_info.update({'end_unload_filament': list(self.print_task_config['end_unload_filament'])})
+            self.print_task_config['reprint_info'] = tmp_reprint_info
             if not self.printer.update_snapmaker_config_file(self.config_path,
                     self.print_task_config, DEFAULT_PRINT_TASK_CONFIG):
                 logging.error("[print_task_config] save print_task_config failed\r\n")
 
-        except:
+        except Exception as e:
             logging.error("[print_task_config] set reprint info failed")
 
     def set_new_print_info(self):
         if True not in self.print_task_config['extruders_used']:
+            tmp_extruders_used = list(self.print_task_config['extruders_used'])
             for i in range(LOGICAL_EXTRUDER_NUM):
                 if self.print_task_config_2['filament_used_g'][i] > 0:
-                    self.print_task_config['extruders_used'][self.print_task_config['extruder_map_table'][i]] = True
+                    tmp_extruders_used[self.print_task_config['extruder_map_table'][i]] = True
+            self.print_task_config['extruders_used'] = tmp_extruders_used
 
         self.set_reprint_info()
 
     def update_filament_edit_flag(self):
+        tmp_filament_edit = list(self.print_task_config['filament_edit'])
         for ch in range(PHYSICAL_EXTRUDER_NUM):
             allowd_edit = False
             if self.print_task_config['filament_exist'][ch]:
@@ -429,7 +476,8 @@ class PrintTaskConfig:
                 else:
                     allowd_edit = True
 
-            self.print_task_config['filament_edit'][ch] = allowd_edit
+            tmp_filament_edit[ch] = allowd_edit
+        self.print_task_config['filament_edit'] = tmp_filament_edit
 
     def update_filament_exist_flag(self):
         filament_feed_infos = {}
@@ -438,6 +486,7 @@ class PrintTaskConfig:
                 status = obj.get_status(0)
                 filament_feed_infos.update(status)
 
+        tmp_filament_exist = list(self.print_task_config['filament_exist'])
         for ch in range(PHYSICAL_EXTRUDER_NUM):
             sensor_obj = self.printer.lookup_object(f'filament_motion_sensor e{ch}_filament', None)
             e_obj = filament_feed_infos.get(f'extruder{ch}', None)
@@ -456,33 +505,31 @@ class PrintTaskConfig:
             else:
                 is_exist = True
 
-            self.print_task_config['filament_exist'][ch] = is_exist
+            tmp_filament_exist[ch] = is_exist
+        self.print_task_config['filament_exist'] = tmp_filament_exist
 
-    def get_status(self, eventtime=None):
-        ##### It is not allowed to adjust the order of the following codes. ####
+    def update_filament_flags(self):
         self.update_filament_exist_flag()
         self.update_filament_edit_flag()
-        ########################################################################
-        print_task_config = copy.deepcopy(self.print_task_config)
+
+    def get_status(self, eventtime=None):
+        print_task_config = dict(self.print_task_config)
         return print_task_config
 
     def cmd_SET_PRINT_EXTRUDER_MAP(self, gcmd):
         config_extruder = gcmd.get_int("CONFIG_EXTRUDER", None)
         map_extruder = gcmd.get_int("MAP_EXTRUDER", None)
-        logging.info("[print_task_config] SET_PRINT_EXTRUDER_MAP %s",
-                        gcmd.get_raw_command_parameters())
+        logging.info("[print_task_config] SET_PRINT_EXTRUDER_MAP %s", gcmd.get_raw_command_parameters())
 
-        machine_state_manager = self.printer.lookup_object('machine_state_manager', None)
-        if machine_state_manager is not None:
-            machine_sta = machine_state_manager.get_status()
-            if str(machine_sta["main_state"]) == "PRINTING":
-                raise gcmd.error(
-                    message = "[print_task_config] not allowed to set extruder map during printing!",
-                    id = 531,
-                    index = 0,
-                    code = 15,
-                    oneshot = 1,
-                    level = 1)
+        print_stats = self.printer.lookup_object('print_stats', None)
+        if print_stats is not None and print_stats.state in ['printing', 'paused']:
+            raise gcmd.error(
+                message = "[print_task_config] not allowed to set extruder map during printing!",
+                id = 531,
+                index = 0,
+                code = 15,
+                oneshot = 1,
+                level = 1)
 
         if config_extruder is None or map_extruder is None:
             raise gcmd.error("[print_task_config] extruder map, incomplete parameters")
@@ -491,13 +538,18 @@ class PrintTaskConfig:
                 (map_extruder < 0 or map_extruder >= PHYSICAL_EXTRUDER_NUM):
             raise gcmd.error("[print_task_config] extruder map, invalid extruder index!!!")
 
-        self.print_task_config['extruder_map_table'][config_extruder] = map_extruder
-        self.print_task_config['reprint_info']['extruder_map_table'][config_extruder] = map_extruder
+        try:
+            tmp_map_table = copy.deepcopy(self.print_task_config['extruder_map_table'])
+            tmp_reprint_info = copy.deepcopy(self.print_task_config['reprint_info'])
 
-        ###### No need, because saving will be triggered in other necessary commands.
-        # if not self.printer.update_snapmaker_config_file(self.config_path,
-        #         self.print_task_config, DEFAULT_PRINT_TASK_CONFIG):
-        #     logging.error("[print_task_config] save print_task_config failed\r\n")
+            tmp_map_table[config_extruder] = map_extruder
+            tmp_reprint_info['extruder_map_table'][config_extruder] = map_extruder
+
+            self.print_task_config['extruder_map_table'] = tmp_map_table
+            self.print_task_config['reprint_info'] = tmp_reprint_info
+
+        except Exception as e:
+            logging.error(f"[print_task_config] set extruder map failed: {str(e)}")
 
     def cmd_GET_PRINT_EXTRUDER_MAP(self, gcmd):
         map_info = ""
@@ -528,8 +580,7 @@ class PrintTaskConfig:
         filament_color_multi_mode = gcmd.get_int('MULTI_MODE', 0, minval=0, maxval=255)
         force = gcmd.get_int('FORCE', False)
 
-        old_print_task_config = copy.deepcopy(self.print_task_config)
-        need_save = False
+        tmp_print_task_config = copy.deepcopy(self.print_task_config)
 
         try:
             logging.info("[print_task_config] PRINT_FILAMENT_CONFIG %s", gcmd.get_raw_command_parameters())
@@ -537,33 +588,33 @@ class PrintTaskConfig:
             if config_extruder < 0 or config_extruder >= PHYSICAL_EXTRUDER_NUM:
                 raise gcmd.error("[print_task_config] extruder{} is out of range[0, {}]".format(config_extruder, PHYSICAL_EXTRUDER_NUM -1))
 
-            if self.print_task_config['filament_official'][config_extruder] and bool(force) == False:
+            if tmp_print_task_config['filament_official'][config_extruder] and bool(force) == False:
                 raise gcmd.error("[print_task_config] filament_config, official filament, not configurable!")
 
             # alpha
             if filament_alpha == None:
-                filament_alpha = int(self.print_task_config['filament_color_rgba'][config_extruder][6:8], 16)
-                old_rgba = self.print_task_config['filament_color_rgba'][config_extruder]
-                self.print_task_config['filament_color_rgba'][config_extruder] = old_rgba[0:6] + f"{filament_alpha:02X}"
-                self.print_task_config['filament_color_multi'][config_extruder]['alpha'] = filament_alpha
+                filament_alpha = int(tmp_print_task_config['filament_color_rgba'][config_extruder][6:8], 16)
+                old_rgba = tmp_print_task_config['filament_color_rgba'][config_extruder]
+                tmp_print_task_config['filament_color_rgba'][config_extruder] = old_rgba[0:6] + f"{filament_alpha:02X}"
+                tmp_print_task_config['filament_color_multi'][config_extruder]['alpha'] = filament_alpha
 
             # vendor and type
             if filament_type is not None:
                 if filament_vendor is None or filament_sub_type is None:
                     raise gcmd.error("[print_task_config] filament_config, incomplete parameters")
 
-                self.print_task_config['filament_vendor'][config_extruder] = filament_vendor
-                self.print_task_config['filament_type'][config_extruder] = filament_type
-                self.print_task_config['filament_sub_type'][config_extruder] = filament_sub_type
+                tmp_print_task_config['filament_vendor'][config_extruder] = filament_vendor
+                tmp_print_task_config['filament_type'][config_extruder] = filament_type
+                tmp_print_task_config['filament_sub_type'][config_extruder] = filament_sub_type
 
                 if filament_soft is not None:
-                    self.print_task_config['filament_soft'][config_extruder] = bool(filament_soft)
+                    tmp_print_task_config['filament_soft'][config_extruder] = bool(filament_soft)
                 else:
                     if self.filament_param_obj is not None:
-                        self.print_task_config['filament_soft'][config_extruder] = \
+                        tmp_print_task_config['filament_soft'][config_extruder] = \
                             self.filament_param_obj.get_is_soft(filament_vendor, filament_type, filament_sub_type)
                     else:
-                        self.print_task_config['filament_soft'][config_extruder] = False
+                        tmp_print_task_config['filament_soft'][config_extruder] = False
 
             # color
             if filament_color_nums is not None or filament_color_rgba is not None or filament_color is not None:
@@ -624,28 +675,23 @@ class PrintTaskConfig:
                     dest_filament_color_multi['mode'] = 0
                     dest_filament_color = filament_color
 
-                self.print_task_config['filament_color'][config_extruder] = dest_filament_color
-                self.print_task_config['filament_color_rgba'][config_extruder] = dest_filament_color_rgba
-                self.print_task_config['filament_color_multi'][config_extruder] = dest_filament_color_multi
+                tmp_print_task_config['filament_color'][config_extruder] = dest_filament_color
+                tmp_print_task_config['filament_color_rgba'][config_extruder] = dest_filament_color_rgba
+                tmp_print_task_config['filament_color_multi'][config_extruder] = dest_filament_color_multi
 
+            tmp_print_task_config['filament_official'][config_extruder] = False
+            tmp_print_task_config['filament_sku'][config_extruder] = 0
+
+            self.print_task_config = tmp_print_task_config
+
+            if not self.printer.update_snapmaker_config_file(self.config_path,
+                    self.print_task_config, DEFAULT_PRINT_TASK_CONFIG):
+                logging.error("[print_task_config] save print_task_config failed\r\n")
 
             self.gcode.run_script_from_command(f"FLOW_RESET_K EXTRUDER={config_extruder}\r\n")
 
-            self.print_task_config['filament_official'][config_extruder] = False
-            self.print_task_config['filament_sku'][config_extruder] = 0
-
-            need_save = True
-
         except Exception as e:
-
-            self.print_task_config = old_print_task_config
             raise gcmd.error(str(e))
-
-        finally:
-            if need_save:
-                if not self.printer.update_snapmaker_config_file(self.config_path,
-                        self.print_task_config, DEFAULT_PRINT_TASK_CONFIG):
-                    logging.error("[print_task_config] save print_task_config failed\r\n")
 
     def cmd_SET_PRINT_PREFERENCES(self, gcmd):
         bed_level = gcmd.get_int('BED_LEVEL', None, minval=0, maxval=1)
@@ -657,18 +703,14 @@ class PrintTaskConfig:
         auto_replenish_ignore_color = gcmd.get_int('REPLENISH_IGNORE_COLOR', None, minval=0, maxval=1)
         filament_entangle_detect = gcmd.get_int('FILAMENT_ENTANGLE_DETECT', None, minval=0, maxval=1)
         filament_entangle_sen = gcmd.get('FILAMENT_ENTANGLE_SEN', None)
+        end_led_turn_off = gcmd.get_int('END_LED_TURN_OFF', None, minval=0, maxval=1)
+        end_unload_filament = gcmd.get('END_UNLOAD_FILAMENT', None)
         logging.info("[print_task_config] SET_PRINT_PREFERENCES %s", gcmd.get_raw_command_parameters())
 
-        machine_state_manager = self.printer.lookup_object('machine_state_manager', None)
-        is_printing = False
-        if machine_state_manager is not None:
-            machine_sta = machine_state_manager.get_status()
-            if str(machine_sta["main_state"]) == "PRINTING":
-                is_printing = True
-
-        if is_printing:
+        print_stats = self.printer.lookup_object('print_stats', None)
+        if print_stats is not None and print_stats.state in ['printing', 'paused']:
             if bed_level is not None or flow_calibrate is not None or shaper_calibrate is not None or \
-                    time_lapse_camera is not None:
+                    time_lapse_camera is not None or end_unload_filament is not None:
                 raise gcmd.error(
                     message = "[print_task_config] not allow to set preferences during printing!",
                     id = 531,
@@ -677,77 +719,114 @@ class PrintTaskConfig:
                     oneshot = 1,
                     level = 1)
 
-        if bed_level is not None:
-            self.print_task_config['auto_bed_leveling'] = bool(bed_level)
-            self.print_task_config['reprint_info']['auto_bed_leveling'] = bool(bed_level)
+        tmp_print_task_config = copy.deepcopy(self.print_task_config)
+        try:
+            if bed_level is not None:
+                tmp_print_task_config['auto_bed_leveling'] = bool(bed_level)
+                tmp_print_task_config['reprint_info']['auto_bed_leveling'] = bool(bed_level)
 
-        if flow_calibrate is not None:
-            self.print_task_config['flow_calibrate'] = bool(flow_calibrate)
-            self.print_task_config['reprint_info']['flow_calibrate'] = bool(flow_calibrate)
+            if flow_calibrate is not None:
+                tmp_print_task_config['flow_calibrate'] = bool(flow_calibrate)
+                tmp_print_task_config['reprint_info']['flow_calibrate'] = bool(flow_calibrate)
 
-        if flow_calibrate_extruders is not None:
-            calib_extruders = [int(value) for value in flow_calibrate_extruders.split(',')]
-            for i in range(PHYSICAL_EXTRUDER_NUM):
-                if i in calib_extruders:
-                    self.print_task_config['flow_calib_extruders'][i] = True
-                    self.print_task_config['reprint_info']['flow_calib_extruders'][i] = True
-                else:
-                    self.print_task_config['flow_calib_extruders'][i] = False
-                    self.print_task_config['reprint_info']['flow_calib_extruders'][i] = False
+            if flow_calibrate_extruders is not None:
+                tmp_print_task_config['flow_calibrate_extruders'] = [True for i in range(PHYSICAL_EXTRUDER_NUM)]
+                tmp_print_task_config['reprint_info'].update({'flow_calibrate_extruders': [True for i in range(PHYSICAL_EXTRUDER_NUM)]})
+                calib_extruders = [int(value) for value in flow_calibrate_extruders.split(',')]
+                for i in range(PHYSICAL_EXTRUDER_NUM):
+                    if i in calib_extruders:
+                        tmp_print_task_config['flow_calib_extruders'][i] = True
+                        tmp_print_task_config['reprint_info']['flow_calib_extruders'][i] = True
+                    else:
+                        tmp_print_task_config['flow_calib_extruders'][i] = False
+                        tmp_print_task_config['reprint_info']['flow_calib_extruders'][i] = False
 
-        if shaper_calibrate is not None:
-            self.print_task_config['shaper_calibrate'] = bool(shaper_calibrate)
+            if shaper_calibrate is not None:
+                tmp_print_task_config['shaper_calibrate'] = bool(shaper_calibrate)
 
-        if time_lapse_camera is not None:
-            self.print_task_config['time_lapse_camera'] = bool(time_lapse_camera)
-            self.print_task_config['reprint_info']['time_lapse_camera'] = bool(time_lapse_camera)
+            if time_lapse_camera is not None:
+                tmp_print_task_config['time_lapse_camera'] = bool(time_lapse_camera)
+                tmp_print_task_config['reprint_info']['time_lapse_camera'] = bool(time_lapse_camera)
 
-        if auto_replenish_filament is not None:
-            self.print_task_config['auto_replenish_filament'] = bool(auto_replenish_filament)
+            if auto_replenish_filament is not None:
+                tmp_print_task_config['auto_replenish_filament'] = bool(auto_replenish_filament)
 
-        if auto_replenish_ignore_color is not None:
-            self.print_task_config['replenish_ignore_color'] = bool(auto_replenish_ignore_color)
+            if auto_replenish_ignore_color is not None:
+                tmp_print_task_config['replenish_ignore_color'] = bool(auto_replenish_ignore_color)
 
-        if filament_entangle_detect is not None:
-            self.print_task_config['filament_entangle_detect'] = bool(filament_entangle_detect)
-            self.printer.send_event("print_task_config:set_entangle_detect", self.print_task_config['filament_entangle_detect'])
+            if filament_entangle_detect is not None:
+                tmp_print_task_config['filament_entangle_detect'] = bool(filament_entangle_detect)
+                self.printer.send_event("print_task_config:set_entangle_detect", tmp_print_task_config['filament_entangle_detect'])
 
-        if filament_entangle_sen is not None:
-            if filament_entangle_sen not in [ENTANGLE_SENSITIVITY_HIGH, ENTANGLE_SENSITIVITY_MEDIUM, ENTANGLE_SENSITIVITY_LOW]:
-                raise gcmd.error(f"[print_task_config] filament_entangle_sen error: {filament_entangle_sen}")
-            self.print_task_config['filament_entangle_sen'] = filament_entangle_sen
-            self.printer.send_event("print_task_config:set_entangle_detect", self.print_task_config['filament_entangle_detect'])
+            if filament_entangle_sen is not None:
+                if filament_entangle_sen not in [ENTANGLE_SENSITIVITY_HIGH, ENTANGLE_SENSITIVITY_MEDIUM, ENTANGLE_SENSITIVITY_LOW]:
+                    raise gcmd.error(f"[print_task_config] filament_entangle_sen error: {filament_entangle_sen}")
+                tmp_print_task_config['filament_entangle_sen'] = filament_entangle_sen
+                self.printer.send_event("print_task_config:set_entangle_detect", tmp_print_task_config['filament_entangle_detect'])
 
-        if not self.printer.update_snapmaker_config_file(self.config_path,
-                    self.print_task_config, DEFAULT_PRINT_TASK_CONFIG):
+            if end_led_turn_off is not None:
+                tmp_print_task_config['end_led_turn_off'] = bool(end_led_turn_off)
+
+            if end_unload_filament is not None:
+                end_unload_filament_list = None
+                try:
+                    end_unload_filament_list = self._parse_str_to_list(end_unload_filament)
+                except Exception as e:
+                    raise gcmd.error("Invalid END_UNLOAD_FILAMENT")
+
+                tmp_print_task_config.update({'end_unload_filament': [False for i in range(PHYSICAL_EXTRUDER_NUM)]})
+                tmp_print_task_config['reprint_info'].update({'end_unload_filament': [False for i in range(PHYSICAL_EXTRUDER_NUM)]})
+
+                for i in range(min(len(end_unload_filament_list), PHYSICAL_EXTRUDER_NUM)):
+                    if not isinstance(end_unload_filament_list[i], int):
+                        raise gcmd.error("[print_task_config] Invalid END_UNLOAD_EXTRUDERS")
+                    tmp_print_task_config['end_unload_filament'][i] = bool(end_unload_filament_list[i])
+                    tmp_print_task_config['reprint_info']['end_unload_filament'][i] = bool(end_unload_filament_list[i])
+
+            self.print_task_config = tmp_print_task_config
+
+            if not self.printer.update_snapmaker_config_file(self.config_path,
+                        self.print_task_config, DEFAULT_PRINT_TASK_CONFIG):
+                logging.error("[print_task_config] save print_task_config failed\r\n")
+
+        except Exception as e:
             logging.error("[print_task_config] save print_task_config failed\r\n")
+            raise gcmd.error(str(e))
 
     def cmd_SET_PRINT_USED_EXTRUDERS(self, gcmd):
         extruders_str = gcmd.get('EXTRUDERS', None)
-        self.print_task_config['extruders_used'] = [False] * PHYSICAL_EXTRUDER_NUM
-        self.print_task_config['reprint_info']['extruders_used'] = [False] * PHYSICAL_EXTRUDER_NUM
         logging.info("[print_task_config] SET_PRINT_USED_EXTRUDERS %s", gcmd.get_raw_command_parameters())
 
-        machine_state_manager = self.printer.lookup_object('machine_state_manager', None)
-        if machine_state_manager is not None:
-            machine_sta = machine_state_manager.get_status()
-            if str(machine_sta["main_state"]) == "PRINTING":
-                raise gcmd.error("[print_task_config] not allow to set used_extruders during printing!")
+        print_stats = self.printer.lookup_object('print_stats', None)
+        if print_stats is not None and print_stats.state in ['printing', 'paused']:
+            raise gcmd.error(
+                message = "[print_task_config] not allow to set used_extruders during printing!",
+                id = 531,
+                index = 0,
+                code = 16,
+                oneshot = 1,
+                level = 1)
 
         if extruders_str is not None:
-            used_extruders = [int(value) for value in extruders_str.split(',')]
-            for i in range(PHYSICAL_EXTRUDER_NUM):
-                if i in used_extruders:
-                    self.print_task_config['extruders_used'][i] = True
-                    self.print_task_config['reprint_info']['extruders_used'][i] = True
-                else:
-                    self.print_task_config['extruders_used'][i] = False
-                    self.print_task_config['reprint_info']['extruders_used'][i] = False
+            tmp_extruders_used = copy.deepcopy(self.print_task_config['extruders_used'])
+            tmp_reprint_info = copy.deepcopy(self.print_task_config['reprint_info'])
+            try:
+                tmp_extruders_used = [False] * PHYSICAL_EXTRUDER_NUM
+                tmp_reprint_info.update({'extruders_used': [False] * PHYSICAL_EXTRUDER_NUM})
+                used_extruders = [int(value) for value in extruders_str.split(',')]
+                for i in range(min(len(used_extruders), LOGICAL_EXTRUDER_NUM)):
+                    tmp_extruders_used[used_extruders[i]] = True
+                    tmp_reprint_info['extruders_used'][used_extruders[i]] = True
 
-        if not self.printer.update_snapmaker_config_file(self.config_path,
-                self.print_task_config, DEFAULT_PRINT_TASK_CONFIG):
-            logging.error("[print_task_config] save print_task_config failed\r\n")
+                self.print_task_config['extruders_used'] = tmp_extruders_used
+                self.print_task_config['reprint_info'] = tmp_reprint_info
 
+                if not self.printer.update_snapmaker_config_file(self.config_path,
+                        self.print_task_config, DEFAULT_PRINT_TASK_CONFIG):
+                    logging.error("[print_task_config] save print_task_config failed\r\n")
+
+            except Exception as e:
+                raise gcmd.error(str(e))
     def cmd_RESET_PRINT_TASK_CONFIG(self, gcmd):
         self._reset_print_task_config()
 
@@ -767,32 +846,30 @@ class PrintTaskConfig:
             return
 
         if is_runout and self.filament_info_backup:
-            old_print_task_config = copy.deepcopy(self.print_task_config)
-            need_save = False
             try:
                 if self.filament_info_backup['filament_type'][extruder_index] != "" and self.filament_info_backup['filament_type'][extruder_index] != "NONE":
-                    self.print_task_config['filament_type'][extruder_index] = self.filament_info_backup['filament_type'][extruder_index]
-                    self.print_task_config['filament_vendor'][extruder_index] = self.filament_info_backup['filament_vendor'][extruder_index]
-                    self.print_task_config['filament_sub_type'][extruder_index] = self.filament_info_backup['filament_sub_type'][extruder_index]
-                    self.print_task_config['filament_soft'][extruder_index] = self.filament_info_backup['filament_soft'][extruder_index]
-                    self.print_task_config['filament_color'][extruder_index] = self.filament_info_backup['filament_color'][extruder_index]
-                    self.print_task_config['filament_color_rgba'][extruder_index] = self.filament_info_backup['filament_color_rgba'][extruder_index]
-                    self.print_task_config['filament_color_multi'][extruder_index] = copy.deepcopy(self.filament_info_backup['filament_color_multi'][extruder_index])
+                    tmp_print_task_config = copy.deepcopy(self.print_task_config)
+                    tmp_print_task_config['filament_type'][extruder_index] = self.filament_info_backup['filament_type'][extruder_index]
+                    tmp_print_task_config['filament_vendor'][extruder_index] = self.filament_info_backup['filament_vendor'][extruder_index]
+                    tmp_print_task_config['filament_sub_type'][extruder_index] = self.filament_info_backup['filament_sub_type'][extruder_index]
+                    tmp_print_task_config['filament_soft'][extruder_index] = self.filament_info_backup['filament_soft'][extruder_index]
+                    tmp_print_task_config['filament_color'][extruder_index] = self.filament_info_backup['filament_color'][extruder_index]
+                    tmp_print_task_config['filament_color_rgba'][extruder_index] = self.filament_info_backup['filament_color_rgba'][extruder_index]
+                    tmp_print_task_config['filament_color_multi'][extruder_index] = copy.deepcopy(self.filament_info_backup['filament_color_multi'][extruder_index])
 
-                    self.print_task_config['filament_official'][extruder_index] = False
-                    self.print_task_config['filament_sku'][extruder_index] = 0
-                    self.gcode.run_script_from_command(f"FLOW_RESET_K EXTRUDER={extruder_index}\r\n")
-                    need_save = True
+                    tmp_print_task_config['filament_official'][extruder_index] = False
+                    tmp_print_task_config['filament_sku'][extruder_index] = 0
 
-            except Exception as e:
-                logging.error("[print_task_config] INNER_CHECK_AND_RELOAD_FILAMENT_INFO error: %s", str(e))
-                self.print_task_config = old_print_task_config
+                    self.print_task_config = tmp_print_task_config
 
-            finally:
-                if need_save:
                     if not self.printer.update_snapmaker_config_file(self.config_path,
                             self.print_task_config, DEFAULT_PRINT_TASK_CONFIG):
                         logging.error("[print_task_config] save print_task_config failed\r\n")
+
+                    self.gcode.run_script_from_command(f"FLOW_RESET_K EXTRUDER={extruder_index}\r\n")
+
+            except Exception as e:
+                logging.error("[print_task_config] INNER_CHECK_AND_RELOAD_FILAMENT_INFO error: %s", str(e))
 
         if self.print_task_config['filament_type'][extruder_index] == "" or self.print_task_config['filament_type'][extruder_index] == "NONE":
             raise gcmd.error(
@@ -814,6 +891,10 @@ class PrintTaskConfig:
 
         toolhead = self.printer.lookup_object("toolhead")
         toolhead.wait_moves()
+
+        if self.is_exec_print_end_action == True:
+            logging.info("[print_task_config] print end ....")
+            return
 
         current_extruder = gcmd.get_int('EXTRUDER')
         if current_extruder < 0 or current_extruder >= PHYSICAL_EXTRUDER_NUM:
@@ -911,7 +992,7 @@ class PrintTaskConfig:
             logging.info(f"feeder info: {str(filament_feed_infos)}")
             logging.info(f"runout sensor info: {str(runout_sensor_infos)}")
             logging.info(f"backup info: {str(self.filament_info_backup)}")
-            logging.info(f"filament info: {str(self.print_task_config['filament_vendor'])}, {str(self.print_task_config['filament_type'])}, {str(self.print_task_config['filament_sub_type'])}, {str(self.print_task_config['filament_color_multi'])}")
+            logging.info(f"filament info: {str(self.print_task_config)}")
             logging.info(f"extruder nozzle diameter: {str(extruder_nozzle_diameter)}")
             logging.info("[print_task_config] ================================================================= ")
             return
@@ -935,16 +1016,19 @@ class PrintTaskConfig:
                 virtual_sdcard.force_refresh_move_env_extruder(replenish_extruder_name)
             self.gcode.run_script_from_command(f"SET_GCODE_VARIABLE MACRO=INNER_RESUME VARIABLE=extruder{current_extruder}_temp VALUE=0\n")
             self.gcode.run_script_from_command(f"M104 S0 T{current_extruder} A0\n")
+
+            tmp_print_task_config = copy.deepcopy(self.print_task_config)
             for i in range(LOGICAL_EXTRUDER_NUM):
-                if self.print_task_config['extruder_map_table'][i] == current_extruder:
-                    self.print_task_config['extruder_map_table'][i] = replenish_extruder
-            self.print_task_config['extruders_used'][current_extruder] = False
-            self.print_task_config['extruders_used'][replenish_extruder] = True
-            self.print_task_config['flow_calib_extruders'][replenish_extruder] = True
-            self.print_task_config['extruders_replenished'][current_extruder] = replenish_extruder
-            self.print_task_config['reprint_info']['extruder_map_table'] = copy.deepcopy(self.print_task_config['extruder_map_table'])
-            self.print_task_config['reprint_info']['flow_calib_extruders'] = copy.deepcopy(self.print_task_config['flow_calib_extruders'])
-            self.print_task_config['reprint_info']['extruders_used'] = copy.deepcopy(self.print_task_config['extruders_used'])
+                if tmp_print_task_config['extruder_map_table'][i] == current_extruder:
+                    tmp_print_task_config['extruder_map_table'][i] = replenish_extruder
+            tmp_print_task_config['extruders_used'][current_extruder] = False
+            tmp_print_task_config['extruders_used'][replenish_extruder] = True
+            tmp_print_task_config['flow_calib_extruders'][replenish_extruder] = True
+            tmp_print_task_config['extruders_replenished'][current_extruder] = replenish_extruder
+            tmp_print_task_config['reprint_info']['extruder_map_table'] = list(tmp_print_task_config['extruder_map_table'])
+            tmp_print_task_config['reprint_info']['flow_calib_extruders'] = list(tmp_print_task_config['flow_calib_extruders'])
+            tmp_print_task_config['reprint_info']['extruders_used'] = list(tmp_print_task_config['extruders_used'])
+            self.print_task_config = tmp_print_task_config
             self.printer.update_snapmaker_config_file(self.config_path, self.print_task_config, DEFAULT_PRINT_TASK_CONFIG)
 
         self.perform_auto_replenish = True
@@ -967,6 +1051,7 @@ class PrintTaskConfig:
         flow_calibrate_extruders = gcmd.get('FLOW_CALIBRATE_EXTRUDERS', None)
         shaper_calibrate = gcmd.get_int('SHAPER_CALIBRATE', None, minval=0, maxval=1)
         time_lapse_camera  = gcmd.get_int('TIME_LAPSE_CAMERA', None, minval=0, maxval=1)
+        end_unload_filament = gcmd.get('END_UNLOAD_FILAMENT', None)
 
         line_width = gcmd.get_float('LINE_WIDTH', None)
         layer_height = gcmd.get_float('LAYER_HEIGHT', None)
@@ -1063,6 +1148,19 @@ class PrintTaskConfig:
                 tmp_print_task_config['time_lapse_camera'] = bool(time_lapse_camera)
             if shaper_calibrate is not None:
                 tmp_print_task_config['shaper_calibrate'] = bool(shaper_calibrate)
+            if end_unload_filament is not None:
+                end_unload_filament_list = None
+                try:
+                    end_unload_filament_list = self._parse_str_to_list(end_unload_filament)
+                except Exception as e:
+                    raise gcmd.error("Invalid END_UNLOAD_FILAMENT")
+
+                tmp_print_task_config.update({'end_unload_filament': [False for i in range(PHYSICAL_EXTRUDER_NUM)]})
+
+                for i in range(min(len(end_unload_filament_list), PHYSICAL_EXTRUDER_NUM)):
+                    if not isinstance(end_unload_filament_list[i], int):
+                        raise gcmd.error("[print_task_config] Invalid END_UNLOAD_EXTRUDERS")
+                    tmp_print_task_config['end_unload_filament'][i] = bool(end_unload_filament_list[i])
 
             # gcode parameters
             if line_width is not None:
@@ -1227,6 +1325,9 @@ class PrintTaskConfig:
                 index = exception_index,
                 oneshot = exception_oneshot,
                 level = exception_level)
+
+    def cmd_INNER_PRINT_END(self, gcmd):
+        self.is_exec_print_end_action = True
 
 def load_config(config):
     return PrintTaskConfig(config)

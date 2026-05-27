@@ -1,7 +1,6 @@
-import logging, copy, os
+import logging, os
 from . import filament_protocol
 from . import fm175xx_reader
-from . import filament_feed
 
 # Error code
 FILAMENT_DT_OK                                  = 0
@@ -32,7 +31,7 @@ class FilamentDetector:
         self._config = self.printer.load_snapmaker_config_file(self._config_path, DEFAULT_FILAMENT_DT_CONFIG)
 
         self._channel_nums = FILAMENT_DT_CHANNEL_NUMS
-        self._filament_info = [copy.deepcopy(filament_protocol.FILAMENT_INFO_STRUCT) for i in range(self._channel_nums)]
+        self._filament_info = [dict(filament_protocol.FILAMENT_INFO_STRUCT) for i in range(self._channel_nums)]
         self._state = [FILAMENT_DT_STATE_IDLE for i in range(self._channel_nums)]
         self._notify_data_update_cb = []
 
@@ -128,7 +127,7 @@ class FilamentDetector:
             is_clear = True
 
         if (filament_info is None):
-            filament_info = copy.deepcopy(filament_protocol.FILAMENT_INFO_STRUCT)
+            filament_info = dict(filament_protocol.FILAMENT_INFO_STRUCT)
         else:
             self._self_test_success_cnt += 1
 
@@ -246,7 +245,7 @@ class FilamentDetector:
         msg = ("channel[%d] test times = %d, success times: %d\n" % (
                 channel, test_times, self._self_test_success_cnt))
         gcmd.respond_info(msg, log=False)
-        msg = ("channel[%d] vendor = %s, main_type: %s, sub_type= %s, rgba_color = %08X\n"
+        msg = ("channel[%d] vendor = %s, main_type: %s, sub_type= %s, argb_color = %08X\n"
                 % (channel,
                     self._filament_info[channel]['VENDOR'],
                     self._filament_info[channel]['MAIN_TYPE'],
@@ -272,12 +271,12 @@ class FilamentDetector:
 
     def get_status(self, eventtime=None):
         return {
-            'info': copy.deepcopy(self._filament_info),
-            'state': copy.deepcopy(self._state),
-            'config': copy.deepcopy(self._config)}
+            'info': [dict(info) for info in self._filament_info],
+            'state': list(self._state),
+            'config': dict(self._config)}
 
     def factory_reset(self):
-        self._config = copy.deepcopy(DEFAULT_FILAMENT_DT_CONFIG)
+        self._config = dict(DEFAULT_FILAMENT_DT_CONFIG)
         ret = self.printer.update_snapmaker_config_file(self._config_path, self._config, DEFAULT_FILAMENT_DT_CONFIG)
         if not ret:
             logging.error("save filament_detect config failed!")

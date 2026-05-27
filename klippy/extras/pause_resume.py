@@ -42,14 +42,17 @@ class PauseResume:
         self.v_sd = self.printer.lookup_object('virtual_sdcard', None)
         self.print_stats = self.printer.lookup_object('print_stats', None)
     def _handle_cancel_request(self, web_request):
+        logging.info("[pause_resume] request cancel")
         self.printer.send_event("pause_resume:cancel")
         self.gcode.run_script("CANCEL_PRINT")
     def _handle_pause_request(self, web_request):
+        logging.info("[pause_resume] request pause")
         if self.v_sd is not None and self.v_sd.work_timer is not None:
             self.v_sd.pl_allow_save_env = False
         self.printer.send_event("pause_resume:pause")
         self.gcode.run_script("PAUSE")
     def _handle_resume_request(self, web_request):
+        logging.info("[pause_resume] request resume")
         self.gcode.run_script("RESUME")
     def get_status(self, eventtime):
         return {
@@ -90,7 +93,7 @@ class PauseResume:
 
         exclude_obj = self.printer.lookup_object('exclude_object', None)
         if exclude_obj is not None:
-            if exclude_obj.get_status()['in_excluded_region'] == True:
+            if exclude_obj.get_status()['in_excluded_region'] == True and self.v_sd.is_cmd_from_sd():
                 gcmd.respond_info("Cannot pause while in an excluded region")
                 return
 
@@ -128,12 +131,17 @@ class PauseResume:
     def cmd_RESUME(self, gcmd):
         if self.print_stats is not None:
             if self.print_stats.state not in ['paused']:
-                gcmd.respond_raw(f"!! Cannot resume while not printing: {self.print_stats.state}")
-                return
+                raise gcmd.error(f"!! Cannot resume while not printing: {self.print_stats.state}")
+
+        machine_state_manager = self.printer.lookup_object('machine_state_manager', None)
+        if machine_state_manager is not None:
+            machine_sta = machine_state_manager.get_status()
+            if str(machine_sta["main_state"]) != "PRINTING" or str(machine_sta["action_code"]) != "IDLE":
+                raise gcmd.error(f"!! Cannot resume while machine main_state: {machine_sta['main_state']} or action_code: {machine_sta['action_code']}")
 
         if self.is_paused == False:
-            gcmd.respond_raw(f"!! Not in paused state and cannot be resumed!\r\n")
-            return
+            raise gcmd.error(f"!! Not in paused state and cannot be resumed!\r\n")
+
         try:
             gcmd.respond_info("Resuming...")
             rawparams = gcmd.get_raw_command_parameters()

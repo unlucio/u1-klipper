@@ -53,12 +53,24 @@ class ExcludeObject:
             self.initial_extrusion_moves = 5
             self.last_position = [0., 0., 0., 0.]
             self.last_position_e = {}
+            self.last_position_e_extruded = {}
+            self.last_position_e_excluded = {}
 
             self.get_position()
             self.last_position_extruded[:] = self.last_position
             self.last_position_excluded[:] = self.last_position
-            self.last_position_e_extruded = {}
-            self.last_position_e_excluded = {}
+
+            for i in range(self.toolhead.max_physical_extruder_num):
+                extruder_obj = self.printer.lookup_object('extruder', None)
+                if i != 0:
+                    extruder_obj = self.printer.lookup_object(f"extruder{i}", None)
+                if extruder_obj is not None:
+                    extruder_name = extruder_obj.get_name()
+                    self.last_position_e[extruder_name] = extruder_obj.last_position
+                    self.last_position_e_extruded[extruder_name] = extruder_obj.last_position
+                    self.last_position_e_excluded[extruder_name] = extruder_obj.last_position
+                    self.max_position_extruded_by_extruder[extruder_name] = extruder_obj.last_position
+                    self.max_position_excluded_by_extruder[extruder_name] = extruder_obj.last_position
 
     def _handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
@@ -139,16 +151,16 @@ class ExcludeObject:
     def get_position(self):
         offset = self._get_extrusion_offsets()
         pos = self.next_transform.get_position()
+        self._get_last_position_e()
         for i in range(4):
             self.last_position[i] = pos[i] + offset[i]
+        extruder_name = self.toolhead.get_extruder().get_name()
+        self.last_position_e[extruder_name] = self.last_position[3]
         return list(self.last_position)
 
     def _normal_move(self, newpos, speed):
         offset = self._get_extrusion_offsets()
         last_pos_e = self._get_last_position_e()
-        self._get_last_position_e_extruded()
-        self._get_last_position_e_excluded()
-        self._get_max_position_extruded()
         extruder_name = self.toolhead.get_extruder().get_name()
 
         if self.initial_extrusion_moves > 0 and \
@@ -197,10 +209,6 @@ class ExcludeObject:
     def _ignore_move(self, newpos, speed):
         offset = self._get_extrusion_offsets()
         last_pos_e = self._get_last_position_e()
-        self._get_last_position_e_excluded()
-        self._get_last_position_e_extruded()
-        self._get_max_position_excluded()
-        self._get_max_position_extruded()
         extruder_name = self.toolhead.get_extruder().get_name()
 
         for i in range(3):
@@ -218,8 +226,6 @@ class ExcludeObject:
         self._ignore_move(newpos, speed)
 
     def _move_from_excluded_region(self, newpos, speed):
-        self._get_last_position_e_excluded()
-        self._get_max_position_excluded()
         extruder_name = self.toolhead.get_extruder().get_name()
 
         self.in_excluded_region = False
@@ -296,6 +302,10 @@ class ExcludeObject:
         reset = gcmd.get('RESET', None)
         current = gcmd.get('CURRENT', None)
         name = gcmd.get('NAME', '').upper()
+
+        if self.toolhead is None:
+            raise self.gcode.error("toolhead not found")
+
         rec_exclude_objects = True
         if reset:
             if name:
@@ -344,7 +354,17 @@ class ExcludeObject:
                 obj['center'] = json.loads('[%s]' % center)
 
             if polygon != None:
-                obj['polygon'] = json.loads(polygon)
+                raw = json.loads(polygon)
+                if len(raw) > 20:
+                    rounded = [[int(round(x)), int(round(y))] for x, y in raw]
+                    deduped = [p for i, p in enumerate(rounded)
+                            if i == 0 or p != rounded[i-1]]
+                    if len(deduped) >= 3:
+                        obj['polygon'] = deduped
+                    else:
+                        obj['polygon'] = [[round(x, 1), round(y, 1)] for x, y in raw]
+                else:
+                    obj['polygon'] = raw
 
             self._add_object_definition(obj)
 

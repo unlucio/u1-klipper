@@ -1488,7 +1488,7 @@ class FilamentParameters:
             return None
 
     def get_status(self, eventtime=None):
-        return copy.deepcopy(self._config)
+        return {}
 
     def get_filaments_max_flow_k(self, soft=False):
         if soft:

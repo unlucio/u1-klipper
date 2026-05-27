@@ -1,4 +1,5 @@
 import json, logging, copy
+from json_compat import dumps
 from abc import ABC, abstractmethod
 from typing import Callable, Dict
 import threading
@@ -118,7 +119,7 @@ class JSONRPCClient:
             "id": request_id
         }
 
-        if self.transport.send(json.dumps(request)):
+        if self.transport.send(dumps(request)):
             with self._lock:
                 self.pending_requests[request_id] = {
                     "request": request,
@@ -173,7 +174,7 @@ class JSONRPCClient:
                 self.sync_request_result = None
             request_time = self.reactor.monotonic()
 
-            if self.transport.send(json.dumps(request)):
+            if self.transport.send(dumps(request)):
                 while self.reactor.monotonic() < request_time + timeout:
                     if self.sync_request_result and self.sync_request_result["id"] == self.sync_request_id:
                         break

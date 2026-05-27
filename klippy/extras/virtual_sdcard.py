@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import os, sys, logging, io
 import json, re, copy, tarfile, threading, queuefile
+from json_compat import dumps
 
 MAX_TOOL_NUMBER = 32
 VALID_GCODE_EXTS = ['gcode', 'g', 'gco']
@@ -33,6 +34,7 @@ PL_PRINT_FAN_INFO_ENV = "pl_print_fan_info_env.json"
 PL_PRINT_Z_ADJUST_POSITION_ENV = "pl_print_z_adjust_position_env.json"
 PL_PRINT_OBJECTS_ENV = "pl_print_objects_env.json"
 PL_PRINT_EXCLUDE_OBJECTS_ENV = "pl_print_exclude_objects_env.json"
+PL_PRINT_PURIFIER_ENV = "pl_print_purifier_env.json"
 
 class VirtualSD:
     def __init__(self, config):
@@ -76,6 +78,7 @@ class VirtualSD:
         self.pl_print_z_adjust_position_env_path = os.path.join(config_dir, PL_PRINT_Z_ADJUST_POSITION_ENV)
         self.pl_print_objects_env_path = os.path.join(config_dir, PL_PRINT_OBJECTS_ENV)
         self.pl_print_exclude_objects_env_path = os.path.join(config_dir, PL_PRINT_EXCLUDE_OBJECTS_ENV)
+        self.pl_print_purifier_env_path = os.path.join(config_dir, PL_PRINT_PURIFIER_ENV)
         self.pl_switch = False
         self.pl_record_file_dir = config_dir
         self.lines = 0
@@ -557,9 +560,10 @@ class VirtualSD:
                     break
                 if not data:
                     # End of file
+                    logging.info(f"Finished SD card print, file: {self.current_file.name}")
                     self.current_file.close()
                     self.current_file = None
-                    logging.info("Finished SD card print")
+
                     self.gcode.respond_raw("Done printing file")
                     self.lines = 0
                     self.current_line_gcode = ''
@@ -701,6 +705,8 @@ class VirtualSD:
                 partial_input = ""
         logging.info("Exiting SD card print, lines=%d, current_line_gcode=%s, file_position=%d",
                             self.lines, self.current_line_gcode, self.file_position)
+        if self.current_file is not None:
+            logging.info(f"file: {self.current_file.name}")
         self.pl_allow_save_env = False
         self.work_timer = None
         self.cmd_from_sd = False
@@ -801,6 +807,7 @@ class VirtualSD:
                     self.pl_print_z_adjust_position_env_path,
                     self.pl_print_objects_env_path,
                     self.pl_print_exclude_objects_env_path,
+                    self.pl_print_purifier_env_path,
                     *[self.pl_print_file_move_env_path.replace('.json', f'_{i}.json')
                         for i in range(self.max_file_count)]
                 ]
@@ -836,6 +843,7 @@ class VirtualSD:
                 self.pl_print_layer_info_env_path,
                 self.pl_print_fan_info_env_path,
                 self.pl_print_z_adjust_position_env_path,
+                self.pl_print_purifier_env_path,
                 *[self.pl_print_file_move_env_path.replace('.json', f'_{i}.json')
                     for i in range(self.max_file_count)]
             ]
@@ -922,6 +930,9 @@ class VirtualSD:
             self.pl_allow_save_env = False
         elif stripped_line.startswith("PRINT_START"):
             self.record_pl_print_objects_env()
+        if stripped_line.startswith("SET_PURIFIER_MODE"):
+            data_dict = {"SET_PURIFIER_MODE" : stripped_line}
+            self.record_pl_print_purifier_env(data_dict)
 
         if (self.pl_env_fan_info_need_update and
             self.pl_env_fan_info_allow_min_time is not None and
@@ -1025,6 +1036,26 @@ class VirtualSD:
         except Exception as e:
             logging.exception("Failed to read print exclude objects environment: %s" % str(e))
             return []
+    def record_pl_print_purifier_env(self, data_dict={}, sync=False, flush=True, safe_write=True):
+        if not self._valid_power_loss_condition():
+            return
+        try:
+            self.save_environment_data(self.pl_print_purifier_env_path, data_dict, sync, flush, safe_write)
+        except Exception as e:
+            logging.exception("Failed to record print purifier environment: %s" % str(e))
+    def get_pl_print_purifier_env(self):
+        if self.pl_switch:
+            if not os.path.exists(self.pl_print_purifier_env_path):
+                return None
+            try:
+                with open(self.pl_print_purifier_env_path, 'r') as f:
+                    file_content = f.read().strip()
+                    if not file_content:
+                        return None
+                    return json.loads(file_content)
+            except Exception as e:
+                logging.exception("Failed to read print purifier environment")
+                return None
     def record_pl_print_file_move_env(self, line, line_count, file_pos, sync=False, flush=True, safe_write=True):
         need_save = False
         if self.pl_switch and self.lines >= self.pl_next_save_line:
@@ -1034,9 +1065,6 @@ class VirtualSD:
 
         if line.startswith("G28"):
             need_save = True
-            if not os.path.exists(self.pl_print_objects_env_path):
-                self.record_pl_print_objects_env()
-            # self.wait_until_not_homing()
 
         curtime = self.reactor.monotonic()
         toolhead = self.printer.lookup_object('toolhead')
@@ -1311,7 +1339,7 @@ class VirtualSD:
         existing_data.update(data_dict)
 
         try:
-            json_content = json.dumps(existing_data, indent=4)
+            json_content = dumps(existing_data, indent=2)
             if sync:
                 queuefile.sync_write_file(self.printer.get_reactor(), file_path, json_content,
                                         flush=flush, safe_write=safe_write)
@@ -1604,6 +1632,12 @@ class VirtualSD:
             bed_temp = pl_temp_env_info.get("heater_bed", 0.0)
             self.gcode.respond_info("power_loss do_resume heater bed: {}".format(bed_temp))
             self.gcode.run_script_from_command("M140 S{}".format(bed_temp))
+
+            purifier_env = self.get_pl_print_purifier_env()
+            if purifier_env is not None:
+                self.gcode.respond_info("power_loss do_resume purifier: {}".format(purifier_env))
+                if "SET_PURIFIER_MODE" in purifier_env:
+                    self.gcode.run_script_from_command(purifier_env["SET_PURIFIER_MODE"])
 
             extruder_list = self.printer.lookup_object('extruder_list', [])
             extruder_temps = {}

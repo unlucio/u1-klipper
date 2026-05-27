@@ -149,11 +149,14 @@ class RunoutHelper:
                     index = self.extruder_index,
                     code = self.exception_manager.list.CODE_TOOLHEAD_FILAMENT_RUNOUT)
         elif is_printing and self.runout_gcode is not None:
-            # runout detected
-            self.min_event_systime = self.reactor.NEVER
             logging.info(
                 "Filament Sensor %s: runout event detected, Time %.2f" %
                 (self.name, eventtime))
+            if self.print_task_config is not None:
+                if self.print_task_config.is_exec_print_end_action == True:
+                    return
+            # runout detected
+            self.min_event_systime = self.reactor.NEVER
             self.reactor.register_callback(self._runout_event_handler)
 
     def get_status(self, eventtime):
@@ -172,6 +175,10 @@ class RunoutHelper:
         self.sensor_enabled = gcmd.get_int("ENABLE", 1)
         self.config['enable'] = bool(self.sensor_enabled)
         logging.info("Filament Sensor: set enable/disable -- %d", self.sensor_enabled)
+
+        print_task_config = self.printer.lookup_object('print_task_config', None)
+        if print_task_config is not None:
+            print_task_config.update_filament_flags()
 
         need_save = gcmd.get_int('SAVE', 1, minval=0, maxval=1)
         if (need_save):

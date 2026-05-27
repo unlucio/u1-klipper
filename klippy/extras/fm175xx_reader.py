@@ -1,6 +1,7 @@
 import logging, time, threading, copy
 import spidev
 import hmac, hashlib
+import gpiod
 
 # channels
 FM175XX_CHANNEL_NUMS                    = 4
@@ -195,20 +196,16 @@ class FM175XXReader:
         self.soc_spi_dev_num = config.getint('soc_spi_dev_num')
         self.soc_spi_mode = config.getint('soc_spi_mode')
         self.soc_spi_speed_max = config.getint('soc_spi_speed_max')
-        soc_rst_pin = config.get('soc_rst_pin')
+
         self.extra_spi_bus = config.getint('extra_spi_bus')
         self.extra_spi_dev_num = config.getint('extra_spi_dev_num')
         self.extra_spi_mode = config.getint('extra_spi_mode')
         self.extra_spi_speed_max = config.getint('extra_spi_speed_max')
-        extra_rst_pin = config.get('extra_rst_pin')
 
         self.soc_ch_1 = config.getint('soc_ch_1')
         self.soc_ch_2 = config.getint('soc_ch_2')
         self.extra_ch_1 = config.getint('extra_ch_1')
         self.extra_ch_2 = config.getint('extra_ch_2')
-
-        rf_1_pin = config.get('rf_1_pin')
-        rf_2_pin = config.get('rf_2_pin')
 
         self._hkdf_key_a = None
         self._hkdf_key_b = None
@@ -216,25 +213,22 @@ class FM175XXReader:
         # SPI Commu
         self.__spi = spidev.SpiDev()
 
-        # RST Pin
-        self.__soc_rst_pin = ppins.setup_pin('digital_out', soc_rst_pin)
-        self.__soc_rst_pin.setup_max_duration(0.)
-        self.__extra_rst_pin = ppins.setup_pin('digital_out', extra_rst_pin)
-        self.__extra_rst_pin.setup_max_duration(0.)
+        # Pins
+        chip = gpiod.Chip('gpiochip1')
+        self.__soc_rst_pin = chip.get_line(25)
+        self.__soc_rst_pin.request(consumer='soc_rst_pin', type=gpiod.LINE_REQ_DIR_OUT, default_val=0)
+        self.__extra_rst_pin = chip.get_line(28)
+        self.__extra_rst_pin.request(consumer='extra_rst_pin', type=gpiod.LINE_REQ_DIR_OUT, default_val=0)
+        self.__rf_1_pin = chip.get_line(27)
+        self.__rf_1_pin.request(consumer='rf_1_pin', type=gpiod.LINE_REQ_DIR_OUT, default_val=0)
+        self.__rf_2_pin = chip.get_line(24)
+        self.__rf_2_pin.request(consumer='rf_2_pin', type=gpiod.LINE_REQ_DIR_OUT, default_val=0)
 
         self.__rst_pin = None
-        self.__rst_ctrl_finish = False
-
-        # rfid sw pin
-        self.__rf_1_pin = ppins.setup_pin('digital_out', rf_1_pin)
-        self.__rf_1_pin.setup_max_duration(0.)
-        self.__rf_2_pin = ppins.setup_pin('digital_out', rf_2_pin)
-        self.__rf_2_pin.setup_max_duration(0.)
-        self.__select_channel_finish = False
 
         self.__card_info_read_flag = 0
         self.__card_info_clear_flag = 0
-        self.__need_to_shutdown = False
+        self.__stop_event = threading.Event()
         self.__card_info_deal_cb = None
         self.__picc_a = Fm175xxPiccMetaData()
 
@@ -246,19 +240,35 @@ class FM175XXReader:
 
         self.__printer.register_event_handler("klippy:ready", self.__ready)
         self.__printer.register_event_handler("klippy:shutdown", self.__shutdown)
+        self.__printer.register_event_handler("klippy:firmware_restart", self.__shutdown)
 
     def __ready(self):
-        self.__select_fm175xx_obj(FM175XX_CHANNEL_1)
-        self.__do_hard_reset()
-        self.__select_fm175xx_obj(FM175XX_CHANNEL_3)
-        self.__do_hard_reset()
-
         # Threading
         background_thread = threading.Thread(target=self.__bg_thread)
         background_thread.start()
 
     def __shutdown(self):
-        self.__need_to_shutdown = True
+        self.__stop_event.set()
+        try:
+            self.__soc_rst_pin.release()
+        except Exception:
+            pass
+        try:
+            self.__extra_rst_pin.release()
+        except Exception:
+            pass
+        try:
+            self.__rf_1_pin.release()
+        except Exception:
+            pass
+        try:
+            self.__rf_2_pin.release()
+        except Exception:
+            pass
+        try:
+            self.__spi.close()
+        except Exception:
+            pass
 
     def __select_fm175xx_obj(self, channel):
         self.__spi.close()
@@ -274,71 +284,20 @@ class FM175XXReader:
             self.__rst_pin = self.__extra_rst_pin
 
     # hardware reset
-    def __do_hard_reset(self):
-        delta_time = 0
-        systime = self.__reactor.monotonic()
-        systime += FM175XX_MIN_TIME + delta_time
-        print_time = self.__rst_pin.get_mcu().estimated_print_time(systime)
-        self.__rst_pin.set_digital(print_time, 0)
-        delta_time += FM175XX_MIN_TIME
-
-        systime = self.__reactor.monotonic()
-        systime += FM175XX_MIN_TIME + delta_time
-        print_time = self.__rst_pin.get_mcu().estimated_print_time(systime)
-        self.__rst_pin.set_digital(print_time, 1)
-
-        self.__rst_ctrl_finish = True
-
     def __hard_reset(self):
-        self.__rst_ctrl_finish = False
-        self.__reactor.register_async_callback(
-            (lambda et, c=self.__do_hard_reset: c()))
-        while 1:
-            if self.__rst_ctrl_finish:
-                break
-            else:
-                time.sleep(0.020)
-        time.sleep(0.5)
-
-    def __do_select_channel(self, channel):
-        delta_time = 0
-        if (channel == self.extra_ch_1 or channel == self.soc_ch_2):
-            systime = self.__reactor.monotonic()
-            systime += FM175XX_MIN_TIME + delta_time
-            print_time = self.__rf_1_pin.get_mcu().estimated_print_time(systime)
-            self.__rf_1_pin.set_digital(print_time, 1)
-            delta_time += 0.100
-
-            systime = self.__reactor.monotonic()
-            systime += FM175XX_MIN_TIME + delta_time
-            print_time = self.__rf_2_pin.get_mcu().estimated_print_time(systime)
-            self.__rf_2_pin.set_digital(print_time, 0)
-
-        else:
-            systime = self.__reactor.monotonic()
-            systime += FM175XX_MIN_TIME + delta_time
-            print_time = self.__rf_1_pin.get_mcu().estimated_print_time(systime)
-            self.__rf_1_pin.set_digital(print_time, 0)
-            delta_time += 0.100
-
-            systime = self.__reactor.monotonic()
-            systime += FM175XX_MIN_TIME + delta_time
-            print_time = self.__rf_2_pin.get_mcu().estimated_print_time(systime)
-            self.__rf_2_pin.set_digital(print_time, 1)
-
-        self.__select_channel_finish = True
+        self.__rst_pin.set_value(0)
+        time.sleep(0.100)
+        self.__rst_pin.set_value(1)
+        time.sleep(0.200)
 
     def __select_channel(self, channel):
-        self.__select_channel_finish = False
-        self.__reactor.register_async_callback(
-            (lambda et, c=self.__do_select_channel, ch=channel: c(ch)))
-        while 1:
-            if self.__select_channel_finish:
-                break
-            else:
-                time.sleep(0.020)
-
-        time.sleep(0.35)
+        if (channel == self.extra_ch_1 or channel == self.soc_ch_2):
+            self.__rf_1_pin.set_value(1)
+            self.__rf_2_pin.set_value(0)
+        else:
+            self.__rf_1_pin.set_value(0)
+            self.__rf_2_pin.set_value(1)
+        time.sleep(0.100)
 
     # read register
     def __register_read(self, addr:int) -> int:
@@ -892,19 +851,23 @@ class FM175XXReader:
         return ret
 
     def __bg_thread(self):
-        time.sleep(0.5)
+        if self.__stop_event.wait(0.5):
+            return
         self.__select_fm175xx_obj(FM175XX_CHANNEL_1)
-        time.sleep(0.05)
+        self.__hard_reset()
+        if self.__stop_event.wait(0.05):
+            return
         ver = self.__register_read(FM175XX_VERSION_REG)
         logging.info("fm175xx[extra] version = 0x%X", ver)
         self.__select_fm175xx_obj(FM175XX_CHANNEL_3)
-        time.sleep(0.05)
+        self.__hard_reset()
+        if self.__stop_event.wait(0.05):
+            return
         ver = self.__register_read(FM175XX_VERSION_REG)
         logging.info("fm175xx[soc] version = 0x%X", ver)
 
         while 1:
-            if self.__need_to_shutdown :
-                self.__need_to_shutdown = False
+            if self.__stop_event.is_set():
                 break
 
             retry_times_1 = 10
@@ -920,6 +883,8 @@ class FM175XXReader:
 
             # Traverse all channels
             for ch in range(FM175XX_CHANNEL_NUMS):
+                if self.__stop_event.is_set():
+                    break
                 if (self.__card_info_read_flag & (1 << ch)) == 0:
                     if (self.__card_info_clear_flag & (1 << ch)) != 0:
                         if (self.__card_info_deal_cb != None):
@@ -938,6 +903,8 @@ class FM175XXReader:
                 logging.info("channel[%d]: start to read card info", ch)
 
                 for retry_1 in range(retry_times_1):
+                    if self.__stop_event.is_set():
+                        break
                     # init reader-A
                     self.__picc_a.reset()
                     self.__reader_a_init()
@@ -946,10 +913,14 @@ class FM175XXReader:
                     self.__set_carrier_wave(FM175XX_CW_ENABLE)
 
                     while 1:
+                        if self.__stop_event.is_set():
+                            break
                         # activate a card
                         ret = FM175XX_ERR
 
                         for retry_2 in range(retry_times_2):
+                            if self.__stop_event.is_set():
+                                break
                             ret = self.__reader_a_activate()
                             if (FM175XX_OK == ret):
                                 break
@@ -1002,7 +973,8 @@ class FM175XXReader:
                     if (self.__card_info_read_flag & (1 << ch)) == 0:
                         break
                     else:
-                        time.sleep(0.02)
+                        if self.__stop_event.wait(0.02):
+                            break
 
                 if (self.__self_test_stage == FM175XX_SELF_TEST_STAGE_DOING):
                     self.__self_test_stage = FM175XX_SELF_TEST_STAGE_STOP
@@ -1012,7 +984,7 @@ class FM175XXReader:
 
                 self.__card_info_read_flag &= ~(1 << ch) & 0xFFFFFFFF
 
-            time.sleep(0.2)
+            self.__stop_event.wait(0.2)
 
     def _hkdf_create_key(self, ikm, salt, key_type='a'):
         sector_count = 16

@@ -209,12 +209,16 @@ class FilamentEntangleDetect:
         if delta_position >= (self.detection_length * self.config['detect_factor'] * global_detect_sen):
             dest_delta_count = int(delta_position / (self.detection_length * self.config['detect_factor'] * global_detect_sen))
             is_tangled = False
-            if check_wheel_counts == True:
-                if delta_count < dest_delta_count:
+            if check_wheel_counts == True and check_wheel_2_counts == True:
+                if delta_count < dest_delta_count and delta_count_2 < dest_delta_count:
                     is_tangled = True
-            if check_wheel_2_counts == True:
-                if delta_count_2 < dest_delta_count:
-                    is_tangled = True
+            else:
+                if check_wheel_counts == True:
+                    if delta_count < dest_delta_count:
+                        is_tangled = True
+                if check_wheel_2_counts == True:
+                    if delta_count_2 < dest_delta_count:
+                        is_tangled = True
 
             if is_tangled:
                 self.printer.send_event("print_stats:update_exception_info",

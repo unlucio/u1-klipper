@@ -1,4 +1,5 @@
-import logging, json
+import logging
+from json_compat import dumps
 import paho.mqtt.client as paho_mqtt
 import threading
 import random
@@ -214,8 +215,8 @@ class MQTTClient:
 
         if isinstance(payload, (dict, list)):
             try:
-                payload = json.dumps(payload)
-            except json.JSONDecodeError:
+                payload = dumps(payload)
+            except TypeError:
                 raise Exception("[mqtt] dict or List is not json encodable")
         elif isinstance(payload, bool):
             payload = str(payload).lower()

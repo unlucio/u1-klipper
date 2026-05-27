@@ -152,7 +152,9 @@ class GCodeMove:
         toolhead = self.printer.lookup_object('toolhead')
         extruder = toolhead.get_extruder()
         print_stats = self.printer.lookup_object('print_stats', None)
-        if print_stats is not None and print_stats.state == 'printing':
+        exclude_obj = self.printer.lookup_object('exclude_object', None)
+        if print_stats is not None and print_stats.state == 'printing' and \
+                exclude_obj is not None and exclude_obj.get_status()['in_excluded_region'] == False:
             extruder.printing_e_pos += delta_e
             if extruder.printing_e_pos > 0:
                 extruder.printing_e_pos = 0

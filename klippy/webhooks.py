@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license
 import logging, socket, os, sys, errno, json, collections
 import gcode
+from json_compat import dumps_bytes
 
 REQUEST_LOG_SIZE = 20
 
@@ -283,8 +284,8 @@ class ClientConnection:
 
     def send(self, data):
         try:
-            jmsg = json.dumps(data, separators=(',', ':'))
-            self.send_buffer += jmsg.encode() + b"\x03"
+            jmsg = dumps_bytes(data)
+            self.send_buffer += jmsg + b"\x03"
         except (TypeError, ValueError) as e:
             msg = ("json encoding error: %s" % (str(e),))
             logging.exception(msg)

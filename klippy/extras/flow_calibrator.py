@@ -1,9 +1,11 @@
 import logging, multiprocessing, os, time, pathlib, queuefile
 from . import motion_report
-from . import flow_calculator
 import numpy as np
 import json
 import copy
+import struct
+import errno
+import threading
 
 # algorithm type
 ALGORITHM_TYPE_DICHOTOMY                = 'DICHOTOMY'
@@ -14,6 +16,109 @@ ABORT_REASON_CANCEL_BY_USER             = 'cancel_by_user'
 ABORT_REASON_FILAMENT_RUNOUT            = 'filament_runout'
 ABORT_REASON_OUT_OF_RANGE               = 'out_of_range'
 ABORT_REASON_FILAMENT_TANGLED           = 'filament_tangled'
+
+class FlowCalcError(Exception):
+    pass
+
+class FlowCalcClient:
+    REQ_PIPE = '/tmp/flow_calculator_req'
+    RESP_PIPE = '/tmp/flow_calculator_resp'
+    TIMEOUT = 30  # seconds
+
+    def check_server(self):
+        """Verify the flow calculator server is running."""
+        if not os.path.exists(self.REQ_PIPE) or not os.path.exists(self.RESP_PIPE):
+            raise FlowCalcError("Flow calculator server is not running: FIFO not found")
+        try:
+            fd = os.open(self.REQ_PIPE, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(fd)
+        except OSError as e:
+            if e.errno == errno.ENXIO:
+                raise FlowCalcError("Flow calculator server is not running: no reader on FIFO")
+            raise
+
+    @staticmethod
+    def _read_exact(fd, n):
+        """Read exactly n bytes from fd."""
+        data = b''
+        while len(data) < n:
+            chunk = os.read(fd, n - len(data))
+            if not chunk:
+                raise FlowCalcError("Connection closed by server")
+            data += chunk
+        return data
+
+    @staticmethod
+    def _write_request(fd, pt, freq, accel_time, loop, slowv, fastv, drop1, drop2):
+        """Write mixed-protocol request.
+
+        total_length = len(header) + len(pt) + len(freq) + len(accel),
+        i.e. the payload after the two prefix ints.
+        """
+        pt_len = len(pt)
+        freq_len = len(freq)
+        accel_len = len(accel_time)
+
+        header = {
+            'loop': loop, 'slowv': slowv, 'fastv': fastv,
+            'drop1': drop1, 'drop2': drop2,
+            'pt_len': pt_len, 'freq_len': freq_len, 'accel_len': accel_len
+        }
+        header_bytes = json.dumps(header).encode('utf-8')
+
+        pt_bytes = np.array(pt, dtype='<f8').tobytes()
+        freq_bytes = np.array(freq, dtype='<i8').tobytes()
+        flat_accel = [v for tup in accel_time for v in tup]
+        accel_bytes = np.array(flat_accel, dtype='<f8').tobytes()
+
+        total_length = len(header_bytes) + len(pt_bytes) + len(freq_bytes) + len(accel_bytes)
+
+        os.write(fd, struct.pack('<II', total_length, len(header_bytes)))
+        os.write(fd, header_bytes)
+        os.write(fd, pt_bytes)
+        os.write(fd, freq_bytes)
+        os.write(fd, accel_bytes)
+
+    @staticmethod
+    def _read_response(fd):
+        """Read response: [total_len(4B)] [JSON payload]"""
+        header = FlowCalcClient._read_exact(fd, 4)
+        length = struct.unpack('<I', header)[0]
+        data = FlowCalcClient._read_exact(fd, length)
+        return json.loads(data.decode('utf-8'))
+
+    def calc_flow_factor(self, pt, freq, accel_time, loop, slowv, fastv, drop1, drop2):
+        """Send calculation request via pipe and return result."""
+        result = [None]
+        error = [None]
+
+        def _do_io():
+            try:
+                req_fd = os.open(self.REQ_PIPE, os.O_WRONLY)
+                self._write_request(req_fd, pt, freq, accel_time,
+                                    loop, slowv, fastv, drop1, drop2)
+                os.close(req_fd)
+
+                resp_fd = os.open(self.RESP_PIPE, os.O_RDONLY)
+                response = self._read_response(resp_fd)
+                os.close(resp_fd)
+                result[0] = response
+            except Exception as e:
+                error[0] = e
+
+        thread = threading.Thread(target=_do_io, daemon=True)
+        thread.start()
+        thread.join(timeout=self.TIMEOUT)
+
+        if thread.is_alive():
+            raise FlowCalcError("Timeout communicating with flow calculator server")
+        if error[0] is not None:
+            raise FlowCalcError(str(error[0]))
+
+        response = result[0]
+        if response.get('status') != 'ok':
+            raise FlowCalcError(response.get('message', 'Unknown error from flow calculator'))
+        return float(response['result'])
 
 DEFAULT_ENV = {
     'k_min': 0.005,
@@ -123,6 +228,7 @@ class FlowCalibrator(object):
         self._env = dict()
         self._load_json_config(self._config_path)
         self._calibrated_in_printing = DEFAULT_CALI_STATE
+        self._flow_calc_client = FlowCalcClient()
 
         debug = config.getint('debug', 0)
         start_args = self._printer.get_start_args()
@@ -203,6 +309,10 @@ class FlowCalibrator(object):
         self._toolhead = self._printer.lookup_object('toolhead')
         self._task_config = self._printer.lookup_object('print_task_config', None)
         self._filament_parameters = self._printer.lookup_object('filament_parameters', None)
+        try:
+            self._flow_calc_client.check_server()
+        except FlowCalcError as e:
+            logging.warning("[flow_calibrator] Flow calculator server check failed: %s", e)
 
     def _handle_reset_file(self):
         extruder_list = self._printer.lookup_object('extruder_list', None)
@@ -306,7 +416,10 @@ class FlowCalibrator(object):
 
         self._end_of_measure()
 
-        area = flow_calculator.calc_flow_factor(freq_pt, freq, accel_ts, params['loop'], params['slow_vel'], params['fast_vel'], 1, 1)
+        self._flow_calc_client.check_server()
+        area = self._flow_calc_client.calc_flow_factor(
+            freq_pt, freq, accel_ts,
+            params['loop'], params['slow_vel'], params['fast_vel'], 1, 1)
         if extruder_dir is None:
             return area
 

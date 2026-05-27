@@ -237,6 +237,8 @@ class Purifier:
         self.check_interval = config.getfloat('check_interval', PERIODIC_STATUS_CHECK_INTERVAL, above=0.)
         self.fan_rpm_fault_threshold = config.getint('fan_rpm_fault_threshold', FAN_RPM_FAULT_THRESHOLD, minval=1)
         self.fan_rpm_fault_counter = 0
+        self.exhaust_fan_speed_threshold = 0
+        self.inner_fan_speed_threshold = 0
 
         # temperature prediction related variables
         self.avg_temp_samples = config.getint('avg_temp_samples', AVG_TEMP_SAMPLES, minval=1)
@@ -682,6 +684,9 @@ class Purifier:
         self.cool_check_last_temp = None
         self.cool_check_timeout_time = None
         self.dynamic_fan_power_adjust_time = None
+        self.exhaust_fan_speed_threshold = 0
+        self.inner_fan_speed_threshold = 0
+
     def set_exhaust_fan_delay_turn_off(self, delay):
         if self._exhaust_fan_state == FAN_STATE_TURN_OFF:
             return
@@ -712,16 +717,19 @@ class Purifier:
 
         status_dict = {
             'power_detected': self._power_detected,
-            'power_det_value': self._power_det_value * 3.3,
+            'power_det_value': round(self._power_det_value * 3.3, 2),
+            'mode': self.purifier_mode,
         }
 
         if exhaust_fan_status is not None:
             status_dict.update({'exhaust_fan': exhaust_fan_status})
             status_dict['exhaust_fan'].update({'delay': self.config_info['exhaust_delay_time']})
+            status_dict['exhaust_fan'].update({'speed_threshold': self.exhaust_fan_speed_threshold})
         if inner_fan_status is not None:
             status_dict.update({'inner_fan': inner_fan_status})
             status_dict['inner_fan'].update({'delay': self.config_info['inner_delay_time']})
-            status_dict['inner_fan'].update({'work': self.config_info['inner_work_time']})
+            status_dict['inner_fan'].update({'work': round(self.config_info['inner_work_time'], 2)})
+            status_dict['inner_fan'].update({'speed_threshold': self.inner_fan_speed_threshold})
 
         return status_dict
 
@@ -900,6 +908,7 @@ class Purifier:
         self.dynamic_fan_control = dynamic_fan_control
         self.set_exhaust_fan_speed(fan_speed)
         self.set_inner_fan_speed(0)
+        self.exhaust_fan_speed_threshold = fan_speed
         self.purifier_mode = MODE_COOL_CHAMBER
         if delay_off is not None:
             if self.config_info.get('exhaust_delay_time', DEFAULT_EXHAUST_FAN_DELAY_TIME) != delay_off:
@@ -921,6 +930,7 @@ class Purifier:
         self.set_exhaust_fan_speed(0)
         self.desired_chamber_temp = desired_temp
         self.purifier_mode = MODE_PREHEAT_CHAMBER
+        self.inner_fan_speed_threshold = fan_speed
         if delay_off is not None:
             if self.config_info.get('inner_delay_time', DEFAULT_INNER_FAN_DELAY_TIME) != delay_off:
                 self.config_info['inner_delay_time'] = delay_off
@@ -940,6 +950,7 @@ class Purifier:
         self.set_exhaust_fan_speed(0)
         self.desired_chamber_temp = desired_temp
         self.purifier_mode = MODE_HOT_CHAMBER
+        self.inner_fan_speed_threshold = fan_speed
         if delay_off is not None:
             if self.config_info.get('inner_delay_time', DEFAULT_INNER_FAN_DELAY_TIME) != delay_off:
                 self.config_info['inner_delay_time'] = delay_off
@@ -990,7 +1001,7 @@ class Purifier:
         timer_execution_counter = self.timer_execution_counter
         last_info_time = cur_time
 
-        self.gcode.run_script_from_command("SET_ACTION_CODE ACTION=PREHRAT_CHAMBER")
+        self.gcode.run_script_from_command("SET_ACTION_CODE ACTION=PREHEAT_CHAMBER")
         while self.preheat_wait_enabled and self.reactor.monotonic() < wait_timeout_time and not self.printer.is_shutdown() and self._power_detected:
             current_time = self.reactor.monotonic()
             if current_time - last_info_time >= 5.0:

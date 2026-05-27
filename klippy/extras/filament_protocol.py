@@ -1,4 +1,3 @@
-import copy
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
@@ -45,7 +44,14 @@ FILAMENT_PROTO_MAIN_TYPE_PETG                   = 2
 FILAMENT_PROTO_MAIN_TYPE_ABS                    = 3
 FILAMENT_PROTO_MAIN_TYPE_TPU                    = 4
 FILAMENT_PROTO_MAIN_TYPE_PVA                    = 5
+FILAMENT_PROTO_MAIN_TYPE_ASA                    = 6
+FILAMENT_PROTO_MAIN_TYPE_PA                     = 9
+FILAMENT_PROTO_MAIN_TYPE_PA_CF                  = 10
+FILAMENT_PROTO_MAIN_TYPE_PA_GF                  = 11
+FILAMENT_PROTO_MAIN_TYPE_PC                     = 12
 FILAMENT_PROTO_MAIN_TYPE_PLA_CF                 = 20
+FILAMENT_PROTO_MAIN_TYPE_PEBA                   = 22
+FILAMENT_PROTO_MAIN_TYPE_TPE                    = 23
 
 FILAMENT_PROTO_MAIN_TYPE_MAPPING = {
     "PLA":          FILAMENT_PROTO_MAIN_TYPE_PLA,
@@ -53,7 +59,14 @@ FILAMENT_PROTO_MAIN_TYPE_MAPPING = {
     "ABS":          FILAMENT_PROTO_MAIN_TYPE_ABS,
     "TPU":          FILAMENT_PROTO_MAIN_TYPE_TPU,
     "PVA":          FILAMENT_PROTO_MAIN_TYPE_PVA,
+    "ASA":          FILAMENT_PROTO_MAIN_TYPE_ASA,
+    "PA":           FILAMENT_PROTO_MAIN_TYPE_PA,
+    "PA-CF":        FILAMENT_PROTO_MAIN_TYPE_PA_CF,
+    "PA-GF":        FILAMENT_PROTO_MAIN_TYPE_PA_GF,
+    "PC":           FILAMENT_PROTO_MAIN_TYPE_PC,
     "PLA-CF":       FILAMENT_PROTO_MAIN_TYPE_PLA_CF,
+    "PEBA":         FILAMENT_PROTO_MAIN_TYPE_PEBA,
+    "TPE":          FILAMENT_PROTO_MAIN_TYPE_TPE,
     "Reserved":     FILAMENT_PROTO_MAIN_TYPE_RESERVED
 }
 
@@ -71,6 +84,7 @@ FILAMENT_PROTO_SUB_TYPE_90A                     = 9
 FILAMENT_PROTO_SUB_TYPE_85A                     = 10
 FILAMENT_PROTO_SUB_TYPE_WOOD                    = 11
 FILAMENT_PROTO_SUB_TYPE_TRANSLUCENT             = 12
+FILAMENT_PROTO_SUB_TYPE_FULL_SPECTRUM           = 13
 
 FILAMENT_PROTO_SUB_TYPE_MAPPING = {
     'Basic':        FILAMENT_PROTO_SUB_TYPE_BASIC,
@@ -85,7 +99,8 @@ FILAMENT_PROTO_SUB_TYPE_MAPPING = {
     '85A':          FILAMENT_PROTO_SUB_TYPE_85A,
     'Wood':         FILAMENT_PROTO_SUB_TYPE_WOOD,
     'Translucent':  FILAMENT_PROTO_SUB_TYPE_TRANSLUCENT,
-    'Reserved':     FILAMENT_PROTO_SUB_TYPE_RESERVED
+    'Full Spectrum':FILAMENT_PROTO_SUB_TYPE_FULL_SPECTRUM,
+    '':             FILAMENT_PROTO_SUB_TYPE_RESERVED
 }
 
 # Filament color nums
@@ -330,13 +345,13 @@ def m1_proto_data_parse(data_buf):
     # check digital signature
     signature_read = []
     for i in range(6):
-        signature_read += copy.copy(data_buf[(10 + i) * 64 : (10 + i) * 64 + 48])
+        signature_read += data_buf[(10 + i) * 64 : (10 + i) * 64 + 48]
     signature_read = bytes(signature_read)
     if (verify_signature_pkcs1(rsa_key_select,
                          bytes(data_buf[0:640]), signature_read[0:256]) == False):
         return FILAMENT_PROTO_SIGN_CHECK_ERR, None
 
-    info = copy.copy(FILAMENT_INFO_STRUCT)
+    info = dict(FILAMENT_INFO_STRUCT)
     info['RSA_KEY_VERSION'] = rsa_ver
 
     tmp = data_buf[M1_PROTO_VERSION_POS : M1_PROTO_VERSION_POS + M1_PROTO_VERSION_LEN]
