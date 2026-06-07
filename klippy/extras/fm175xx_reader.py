@@ -241,10 +241,15 @@ class FM175XXReader:
         self.__printer.register_event_handler("klippy:ready", self.__ready)
         self.__printer.register_event_handler("klippy:shutdown", self.__shutdown)
         self.__printer.register_event_handler("klippy:firmware_restart", self.__shutdown)
+        # A soft RESTART fires only klippy:disconnect (not shutdown/firmware_restart).
+        # Without releasing here the background thread keeps running in the same
+        # process and holds the gpiod lines, so the next config load fails with
+        # "[Errno 16] Device or resource busy". __shutdown is idempotent.
+        self.__printer.register_event_handler("klippy:disconnect", self.__shutdown)
 
     def __ready(self):
         # Threading
-        background_thread = threading.Thread(target=self.__bg_thread)
+        background_thread = threading.Thread(target=self.__bg_thread, daemon=True)
         background_thread.start()
 
     def __shutdown(self):
