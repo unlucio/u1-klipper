@@ -140,8 +140,6 @@ class PrintTaskConfig:
         webhooks.register_endpoint("print_task_config/set_print_preferences",
                                    self._handle_set_print_preferences)
         self.printer.register_event_handler("klippy:ready", self._ready)
-        self.printer.register_event_handler("filament_feed:port", self._feed_port_evt_handle)
-        self.printer.register_event_handler("filament_switch_sensor:runout", self._runout_evt_handle)
 
     def _handle_set_print_preferences(self, web_request):
         tmp_print_task_config = copy.deepcopy(self.print_task_config)
@@ -273,13 +271,6 @@ class PrintTaskConfig:
             self.filament_dt_obj.register_cb_2_update_filament_info(self._rfid_filament_info_update_cb)
 
         self.backup_filament_info()
-        self.update_filament_flags()
-
-    def _feed_port_evt_handle(self, channel, detect):
-        self.update_filament_flags()
-
-    def _runout_evt_handle(self, extruder, present):
-        self.update_filament_flags()
 
     def _reset_print_task_config(self):
         self.print_task_config = copy.deepcopy(DEFAULT_PRINT_TASK_CONFIG)
@@ -368,10 +359,10 @@ class PrintTaskConfig:
         except Exception as e:
             logging.error(f"[print_task_config] rfid info error: {str(e)}")
 
-        self.update_filament_flags()
 
-        # do not use run_script_from_command api
-        self.gcode.run_script(f"FLOW_RESET_K EXTRUDER={channel}\r\n")
+        if is_clear == False:
+            # do not use run_script_from_command api
+            self.gcode.run_script(f"FLOW_RESET_K EXTRUDER={channel}\r\n")
 
     def get_extruder_map_table(self):
         return self.print_task_config['extruder_map_table']
@@ -464,20 +455,21 @@ class PrintTaskConfig:
                     tmp_extruders_used[self.print_task_config['extruder_map_table'][i]] = True
             self.print_task_config['extruders_used'] = tmp_extruders_used
 
+        self.is_exec_print_end_action = False
+        self.backup_filament_info()
         self.set_reprint_info()
 
     def update_filament_edit_flag(self):
         tmp_filament_edit = list(self.print_task_config['filament_edit'])
         for ch in range(PHYSICAL_EXTRUDER_NUM):
-            allowd_edit = False
+            allowed_edit = False
             if self.print_task_config['filament_exist'][ch]:
-                if self.print_task_config['filament_official'][ch] == True:
-                    allowd_edit = False
-                else:
-                    allowd_edit = True
+                if self.print_task_config['filament_official'][ch] == False:
+                    allowed_edit = True
 
-            tmp_filament_edit[ch] = allowd_edit
-        self.print_task_config['filament_edit'] = tmp_filament_edit
+            tmp_filament_edit[ch] = allowed_edit
+        if tmp_filament_edit != self.print_task_config['filament_edit']:
+            self.print_task_config['filament_edit'] = tmp_filament_edit
 
     def update_filament_exist_flag(self):
         filament_feed_infos = {}
@@ -491,28 +483,23 @@ class PrintTaskConfig:
             sensor_obj = self.printer.lookup_object(f'filament_motion_sensor e{ch}_filament', None)
             e_obj = filament_feed_infos.get(f'extruder{ch}', None)
             is_exist = True
-            if sensor_obj != None and sensor_obj.get_status(0)['enabled']:
-                if sensor_obj.get_status(0)['filament_detected']:
-                    is_exist = True
-                else:
-                    if e_obj != None and e_obj['module_exist'] and not e_obj['disable_auto']:
-                        if e_obj['filament_detected']:
-                            is_exist = True
+            if sensor_obj is not None:
+                sensor_status = sensor_obj.get_status(0)
+                if sensor_status['enabled']:
+                    if not sensor_status['filament_detected']:
+                        if e_obj != None and e_obj['module_exist'] and not e_obj['disable_auto']:
+                            if not e_obj['filament_detected']:
+                                is_exist = False
                         else:
                             is_exist = False
-                    else:
-                        is_exist = False
-            else:
-                is_exist = True
 
             tmp_filament_exist[ch] = is_exist
-        self.print_task_config['filament_exist'] = tmp_filament_exist
-
-    def update_filament_flags(self):
-        self.update_filament_exist_flag()
-        self.update_filament_edit_flag()
+        if tmp_filament_exist != self.print_task_config['filament_exist']:
+            self.print_task_config['filament_exist'] = tmp_filament_exist
 
     def get_status(self, eventtime=None):
+        self.update_filament_exist_flag()
+        self.update_filament_edit_flag()
         print_task_config = dict(self.print_task_config)
         return print_task_config
 
@@ -683,6 +670,7 @@ class PrintTaskConfig:
             tmp_print_task_config['filament_sku'][config_extruder] = 0
 
             self.print_task_config = tmp_print_task_config
+            self.backup_filament_info(config_extruder)
 
             if not self.printer.update_snapmaker_config_file(self.config_path,
                     self.print_task_config, DEFAULT_PRINT_TASK_CONFIG):
@@ -968,13 +956,12 @@ class PrintTaskConfig:
                             self.print_task_config['filament_vendor'][i] == self.filament_info_backup['filament_vendor'][current_extruder] and \
                             self.print_task_config['filament_type'][i] == self.filament_info_backup['filament_type'][current_extruder] and \
                             self.print_task_config['filament_sub_type'][i] == self.filament_info_backup['filament_sub_type'][current_extruder]:
-                        if self.print_task_config['replenish_ignore_color'] == True:
+                        if self.print_task_config['filament_color_multi'][i] == self.filament_info_backup['filament_color_multi'][current_extruder]:
                             replenish_extruder = i
                             break
-                        else:
-                            if self.print_task_config['filament_color_multi'][i] == self.filament_info_backup['filament_color_multi'][current_extruder]:
-                                replenish_extruder = i
-                                break
+                        elif self.print_task_config['replenish_ignore_color'] == True and replenish_extruder is None:
+                            replenish_extruder = i
+                            # don't break, keep looking for exact color match
 
         if replenish_extruder == None:
             runout_sensors = self.printer.lookup_objects('filament_motion_sensor')

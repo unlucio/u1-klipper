@@ -226,8 +226,8 @@ STEPCOMPRESS_FLUSH_TIME = 0.050
 SDS_CHECK_TIME = 0.001 # step+dir+step filter in stepcompress.c
 MOVE_HISTORY_EXPIRE = 30.
 
-DRIP_SEGMENT_TIME = 0.050
-DRIP_TIME = 0.100
+DRIP_SEGMENT_TIME = 0.100
+DRIP_TIME = 0.350
 class DripModeEndSignal(Exception):
     pass
 
@@ -332,7 +332,7 @@ class ToolHead:
                                             self._handle_shutdown)
         # Load some default modules
         modules = ["gcode_move", "homing", "idle_timeout", "statistics",
-                   "manual_probe", "tuning_tower", "machine_state_manager"]
+                   "manual_probe", "tuning_tower", "machine_state_manager","garbage_collection"]
         for module_name in modules:
             self.printer.load_object(config, module_name)
 

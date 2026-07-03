@@ -88,6 +88,7 @@ FEED_PORT_ADC_SAMPLE_COUNT                          = 4
 FEED_PORT_ADC_REPORT_TIME                           = 0.300
 FEED_PORT_ADC_VAL_THRESHOLD                         = 0.18
 FEED_PORT_ADC_VAL_MODULE_EXIST                      = 0.9
+FEED_PORT_ADC_DEBOUNCE_COUNT                         = 2
 
 FEED_MOTOR_DIR_IDLE                                 = 0
 FEED_MOTOR_DIR_A                                    = 1
@@ -151,8 +152,8 @@ class FeedLight:
     def set_light_state(self, print_time, state, index=None, value=None):
         if state in [FEED_STA_PRELOAD_PREPARE, FEED_STA_LOAD_PREPARE, FEED_STA_UNLOAD_PREPARE,
                      FEED_STA_MANUAL_PREPARE]:
-            self.red_light.set_pwm(print_time, 0)
-            self.white_light.set_pwm(print_time, 0.2)
+            self.red_light.set_pwm(print_time, 0, FEED_MIN_TIME)
+            self.white_light.set_pwm(print_time, 0.2, FEED_MIN_TIME)
         elif state in [FEED_STA_PRELOAD_FEEDING, FEED_STA_LOAD_HOMING, FEED_STA_LOAD_PICKING,
                        FEED_STA_LOAD_HEATING, FEED_STA_LOAD_FEEDING, FEED_STA_LOAD_EXTRUDING,
                        FEED_STA_LOAD_FLUSHING, FEED_STA_UNLOAD_HOMING, FEED_STA_UNLOAD_PICKING,
@@ -161,30 +162,30 @@ class FeedLight:
                        FEED_STA_MANUAL_PICKING, FEED_STA_MANUAL_PREPARE_FINISH, FEED_STA_MANUAL_HEATING,
                        FEED_STA_MANUAL_EXTRUDING, FEED_STA_MANUAL_EXTRUDE_FINISH, FEED_STA_MANUAL_FLUSHING,
                        FEED_STA_MANUAL_FLUSH_FINISH]:
-            self.red_light.set_pwm(print_time, 0)
-            self.white_light.set_pwm(print_time, 0.5)
+            self.red_light.set_pwm(print_time, 0, FEED_MIN_TIME)
+            self.white_light.set_pwm(print_time, 0.5, FEED_MIN_TIME)
         elif state in [FEED_STA_PRELOAD_FINISH, FEED_STA_LOAD_FINISH, FEED_STA_UNLOAD_FINISH,
                        FEED_STA_MANUAL_FINISH]:
-            self.red_light.set_pwm(print_time, 0)
-            self.white_light.set_pwm(print_time, 1)
+            self.red_light.set_pwm(print_time, 0, FEED_MIN_TIME)
+            self.white_light.set_pwm(print_time, 1, FEED_MIN_TIME)
         elif state in [FEED_STA_PRELOAD_FAIL, FEED_STA_LOAD_FAIL, FEED_STA_UNLOAD_FAIL,
                        FEED_STA_MANUAL_PREPARE_FAIL, FEED_STA_MANUAL_EXTRUDE_FAIL,
                        FEED_STA_MANUAL_FLUSH_FAIL, FEED_STA_MANUAL_FAIL]:
-            self.red_light.set_pwm(print_time, 1)
-            self.white_light.set_pwm(print_time, 0)
+            self.red_light.set_pwm(print_time, 1, FEED_MIN_TIME)
+            self.white_light.set_pwm(print_time, 0, FEED_MIN_TIME)
         elif state == FEED_STA_TEST:
             if index == 'RED' and value is not None:
-                self.red_light.set_pwm(print_time, value)
+                self.red_light.set_pwm(print_time, value, FEED_MIN_TIME)
             elif index == 'WHITE' and value is not None:
-                self.white_light.set_pwm(print_time, value)
+                self.white_light.set_pwm(print_time, value, FEED_MIN_TIME)
             elif index == 'ALL' and value is not None:
-                self.red_light.set_pwm(print_time, value)
-                self.white_light.set_pwm(print_time, value)
+                self.red_light.set_pwm(print_time, value, FEED_MIN_TIME)
+                self.white_light.set_pwm(print_time, value, FEED_MIN_TIME)
             else:
                 pass
         else:
-            self.red_light.set_pwm(print_time, 0)
-            self.white_light.set_pwm(print_time, 0)
+            self.red_light.set_pwm(print_time, 0, FEED_MIN_TIME)
+            self.white_light.set_pwm(print_time, 0, FEED_MIN_TIME)
 
 class FeedPort:
     def __init__(self, printer, reactor, pin, threshold):
@@ -196,6 +197,8 @@ class FeedPort:
         self._filament_detected = True
         self._last_filament_detected = True
         self._port_event_callback = None
+        self._pending_state = True
+        self._stable_count = 0
 
         self._port.setup_adc_sample(FEED_PORT_ADC_SAMPLE_TIME, FEED_PORT_ADC_SAMPLE_COUNT)
         self._port.setup_adc_callback(FEED_PORT_ADC_REPORT_TIME, self._adc_callback)
@@ -214,14 +217,23 @@ class FeedPort:
 
     def _adc_callback(self, read_time, read_value):
         self._port_adc_value = read_value
-        if (self._port_adc_value < self._threshold):
-            self._filament_detected = True
-        else:
-            self._filament_detected = False
+        current_detected = self._port_adc_value < self._threshold
 
-        if (None != self._port_event_callback and self._last_filament_detected != self._filament_detected):
-            self._last_filament_detected = self._filament_detected
-            self._port_event_callback(self._filament_detected)
+        if current_detected == self._pending_state:
+            if self._stable_count < FEED_PORT_ADC_DEBOUNCE_COUNT:
+                self._stable_count += 1
+        else:
+            self._pending_state = current_detected
+            self._stable_count = 1
+
+        if (self._stable_count >= FEED_PORT_ADC_DEBOUNCE_COUNT
+                and self._pending_state != self._filament_detected):
+            self._filament_detected = self._pending_state
+            self._stable_count = 0
+            if (self._port_event_callback is not None
+                    and self._last_filament_detected != self._filament_detected):
+                self._last_filament_detected = self._filament_detected
+                self._port_event_callback(self._filament_detected)
 
     def get_adc_value(self):
         return self._port_adc_value
@@ -508,6 +520,7 @@ class FilamentFeed:
         self.check_coil_freq = config.getint('check_coil_freq', 1)
         if self.check_coil_freq == 0 and self.check_wheel_data == 0:
             raise Exception("check_wheel_data and check_coil_freq can not be both 0")
+        self.debug_mode = config.getint('debug_mode', 0)
 
         # other gcode cmd
         self.gcode.register_mux_command("FEED_AUTO", "MODULE",
@@ -627,6 +640,13 @@ class FilamentFeed:
         self._port_event_handler(detected, FEED_CHANNEL_2)
 
     def _port_event_handler(self, detected, channel):
+        if self.debug_mode != 0:
+            logging.info("[feed] port event: channel=%d, detected=%d" % (channel, detected))
+            runout_sensor_status = self.runout_sensor[channel].get_status(0)
+            feed_status = self.get_status()
+            logging.info("[feed] port event: channel=%d, runout_sensor_status=%s, feed_status=%s" % (channel, str(runout_sensor_status), str(feed_status)))
+
+
         if self.config['auto_mode'][channel] == False or \
                 self.module_exist[channel] == False:
             return
@@ -940,12 +960,15 @@ class FilamentFeed:
                     self.exception_code[ch] = 30
                     self.manual_feeding[ch] = False
                     self.channel_error_state[ch] = FEED_STA_NONE
+                    is_last_preload_normal = bool(self.channel_state[ch] == FEED_STA_PRELOAD_FINISH)
                     self._set_channel_state(ch, FEED_STA_LOAD_PREPARE, True)
 
                     if self._port[ch].get_filament_detected() == False:
                         self.channel_error[ch] = FEED_ERR_NO_FILAMENT
                         self.exception_code[ch] = 33
                         raise ValueError('logic error!')
+
+                    self.gcode.run_script_from_command("M104 S%d\r\n" % (filament_feed_temp - 70))
 
                     # home
                     try:
@@ -965,6 +988,11 @@ class FilamentFeed:
                     except:
                         self.channel_error[ch] = FEED_ERR_MOVE_SWITCH
                         raise
+
+                    if is_last_preload_normal:
+                        self.gcode.run_script_from_command("M104 S%d\r\n" % (filament_feed_temp))
+                    else:
+                        self.gcode.run_script_from_command("M104 S%d\r\n" % (filament_feed_temp - 50))
 
                     # feed filament
                     self._set_channel_state(ch, FEED_STA_LOAD_FEEDING)

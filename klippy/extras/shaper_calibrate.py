@@ -3,7 +3,7 @@
 # Copyright (C) 2020-2024  Dmitry Butyugin <dmbutyugin@google.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import collections, importlib, logging, math, multiprocessing, traceback
+import collections, importlib, logging, math, multiprocessing, os, traceback
 shaper_defs = importlib.import_module('.shaper_defs', 'extras')
 
 MIN_FREQ = 5.
@@ -76,6 +76,10 @@ class ShaperCalibrate:
         parent_conn, child_conn = multiprocessing.Pipe()
         def wrapper():
             queuelogger.clear_bg_logging()
+            minor_core = self.printer.get_start_args().get('minor_core')
+            if minor_core:
+                os.sched_setaffinity(0, minor_core)
+            os.setpriority(os.PRIO_PROCESS, 0, 0)
             try:
                 res = method(*args)
             except:

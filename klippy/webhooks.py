@@ -494,11 +494,15 @@ class QueryStatusHelper:
                    if hasattr(o, 'get_status')]
         web_request.send({'objects': objects})
     def _do_query(self, eventtime):
+        reactor = self.printer.get_reactor()
         last_query = self.last_query
         query = self.last_query = {}
         msglist = self.pending_queries
         self.pending_queries = []
         msglist.extend(self.clients.values())
+        last_yield_time = reactor.monotonic()
+        YIELD_SINGLE_TIME = 0.010
+        YIELD_CUMULATIVE_TIME = 0.020
         # Generate get_status() info for each client
         for cconn, subscription, send_func, template in msglist:
             is_query = cconn is None
@@ -514,7 +518,14 @@ class QueryStatusHelper:
                     if po is None or not hasattr(po, 'get_status'):
                         res = query[obj_name] = {}
                     else:
+                        now = reactor.monotonic()
                         res = query[obj_name] = po.get_status(eventtime)
+                        dur = reactor.monotonic() - now
+                        if (dur > YIELD_SINGLE_TIME
+                                or (reactor.monotonic() - last_yield_time
+                                    >= YIELD_CUMULATIVE_TIME)):
+                            reactor.pause(reactor.NOW)
+                            last_yield_time = reactor.monotonic()
                 if req_items is None:
                     req_items = list(res.keys())
                     if req_items:
@@ -532,9 +543,12 @@ class QueryStatusHelper:
                 tmp = dict(template)
                 tmp['params'] = {'eventtime': eventtime, 'status': cquery}
                 send_func(tmp)
+                if (reactor.monotonic() - last_yield_time
+                        >= YIELD_CUMULATIVE_TIME):
+                    reactor.pause(reactor.NOW)
+                    last_yield_time = reactor.monotonic()
         if not query:
             # Unregister timer if there are no longer any subscriptions
-            reactor = self.printer.get_reactor()
             reactor.unregister_timer(self.query_timer)
             self.query_timer = None
             return reactor.NEVER

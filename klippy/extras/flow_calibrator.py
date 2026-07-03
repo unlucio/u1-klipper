@@ -494,8 +494,15 @@ class FlowCalibrator(object):
                 extruder.nozzle_diameter)
 
         self._set_pressure_advance(extruder, default_k)
+        need_save = False
+        if extruder.get_name() not in self._current_k:
+            need_save = True
+        else:
+            if self._current_k[extruder.get_name()] != default_k:
+                need_save = True
         self._current_k[extruder.get_name()] = default_k
-        self._save_config()
+        if need_save:
+            self._save_config()
 
     def _apply_calibrate_k(self, extruder_index):
         extruder = None

@@ -84,9 +84,8 @@ class QueueListener:
                         with open(temp_filename, 'w') as f:
                             if op.content:
                                 f.write(op.content)
-                            if op.flush:
-                                f.flush()
-                                # os.fsync(f.fileno())
+                            # f.flush()
+                            # os.fdatasync(f.fileno())
                         os.replace(temp_filename, op.filename)
                     except Exception:
                         if os.path.exists(temp_filename):
@@ -99,9 +98,8 @@ class QueueListener:
                     with open(op.filename, 'w') as f:
                         if op.content:
                             f.write(op.content)
-                        if op.flush:
-                            f.flush()
-                            # os.fsync(f.fileno())
+                        # f.flush()
+                        # os.fdatasync(f.fileno())
                 result = True
 
             elif op.op_type == "delete":
@@ -111,7 +109,7 @@ class QueueListener:
                     shutil.rmtree(op.filename)
                 result = True
 
-            elif op.op_type == "append":
+            elif op.op_type == "append" and op.content:
                 directory = os.path.dirname(op.filename)
                 if directory and not os.path.exists(directory):
                     os.makedirs(directory, exist_ok=True)
@@ -126,11 +124,9 @@ class QueueListener:
 
                         with open(temp_filename, 'w') as f:
                             f.write(original_content)
-                            if op.content:
-                                f.write(op.content)
-                            if op.flush:
-                                f.flush()
-                                # os.fsync(f.fileno())
+                            f.write(op.content)
+                            # f.flush()
+                            # os.fdatasync(f.fileno())
 
                         os.replace(temp_filename, op.filename)
                     except Exception:
@@ -142,11 +138,9 @@ class QueueListener:
                         raise
                 else:
                     with open(op.filename, 'a') as f:
-                        if op.content:
-                            f.write(op.content)
-                        if op.flush:
-                            f.flush()
-                            # os.fsync(f.fileno())
+                        f.write(op.content)
+                        # f.flush()
+                        # os.fdatasync(f.fileno())
                 result = True
 
             if op.sync:

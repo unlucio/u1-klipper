@@ -223,7 +223,7 @@ class MCU_trsync:
             s.note_homing_end()
         return params['trigger_reason']
 
-TRSYNC_TIMEOUT = 0.050
+TRSYNC_TIMEOUT = 0.350
 TRSYNC_SINGLE_MCU_TIMEOUT = 0.250
 
 class TriggerDispatch:
@@ -233,10 +233,11 @@ class TriggerDispatch:
         ffi_main, ffi_lib = chelper.get_ffi()
         self._trdispatch = ffi_main.gc(ffi_lib.trdispatch_alloc(), ffi_lib.free)
         self._trsyncs = [MCU_trsync(mcu, self._trdispatch)]
+        self._home_queue = mcu.alloc_command_queue()
     def get_oid(self):
         return self._trsyncs[0].get_oid()
     def get_command_queue(self):
-        return self._trsyncs[0].get_command_queue()
+        return self._home_queue
     def add_stepper(self, stepper):
         trsyncs = {trsync.get_mcu(): trsync for trsync in self._trsyncs}
         trsync = trsyncs.get(stepper.get_mcu())
@@ -1049,6 +1050,30 @@ class MCU:
                      self._name, eventtime)
         index = {'host': 0, 'mcu': 1, 'e0': 2, 'e1': 3, 'e2': 4,'e3': 5}.get(self._name, 255)
         err_info = "Lost communication with MCU '%s'" % (self._name,)
+        if index in (2, 3, 4, 5):
+            all_down = True
+            checked = 0
+            pending_info = []
+            for check_name in ['e0', 'e1', 'e2', 'e3']:
+                obj = None
+                for section in ('mcu ' + check_name, 'mcu ' + check_name.upper()):
+                    obj = self._printer.lookup_object(section, None)
+                    if obj is not None:
+                        break
+                if obj is None:
+                    pending_info.append("%s=N/A" % check_name)
+                    all_down = False
+                    continue
+                pending = obj._clocksync.queries_pending
+                pending_info.append("%s=%d" % (check_name, pending))
+                checked += 1
+                if pending < 4:
+                    all_down = False
+            logging.info("MCU timeout check: %s, all_down=%s",
+                         " ".join(pending_info), all_down)
+            if checked == 4 and all_down:
+                index = 100
+                err_info += ", All extruder MCUs lost"
         coded, oneshot = f"0003-0522-{index:04d}-0008", 0
         coded_message = '{"coded": "%s", "oneshot": %d, "msg":"%s"}' % (coded, oneshot, err_info)
         self._printer.invoke_shutdown(coded_message)

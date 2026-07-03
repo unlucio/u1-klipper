@@ -25,9 +25,11 @@ FAN_RPM_FAULT_THRESHOLD                             = 20
 AVG_TEMP_SAMPLES                                    = 10
 DESIRED_CRITICAL_MIN_TEMP_DIFF                      = 1.0
 DYNAMIC_FAN_POWER_INCREMENT                         = 0.1
+DYNAMIC_FAN_POWER_DECREMENT                         = 0.05
 DYNAMIC_FAN_POWER_ADJUST_INTERVAL                   = 50.0
 COOL_CHECK_TIMEOUT_INTERVAL                         = 240
 COOLING_ACTIVATION_OFFSET                           = 0
+COOLING_FAN_POWER_START_INCREMENT                   = 5
 PREHEAT_CHECK_TIMEOUT_INTERVAL                      = 180
 PREHEAT_MIN_VALID_RISE_TEMP                         = 0.0
 
@@ -243,9 +245,11 @@ class Purifier:
         # temperature prediction related variables
         self.avg_temp_samples = config.getint('avg_temp_samples', AVG_TEMP_SAMPLES, minval=1)
         self.dynamic_fan_power_increment = config.getfloat('dynamic_fan_power_increment', DYNAMIC_FAN_POWER_INCREMENT, above=0.0)
+        self.dynamic_fan_power_decrement = config.getfloat('dynamic_fan_power_decrement', DYNAMIC_FAN_POWER_DECREMENT, above=0.0)
         self.desired_critical_min_temp_diff = config.getfloat('desired_critical_min_temp_diff',
                                                                 DESIRED_CRITICAL_MIN_TEMP_DIFF, minval=0.0)
         self.cooling_activation_offset = config.getfloat('cooling_activation_offset', COOLING_ACTIVATION_OFFSET, minval=0.0)
+        self.cooling_fan_power_start_increment = config.getfloat('cooling_fan_power_start_increment', COOLING_FAN_POWER_START_INCREMENT, minval=0.0)
         self.preheat_check_timeout_interval = config.getfloat('preheat_check_timeout_interval', PREHEAT_CHECK_TIMEOUT_INTERVAL, minval=0)
         self.preheat_min_valid_rise_temp  = config.getfloat('preheat_min_valid_rise_temp', PREHEAT_MIN_VALID_RISE_TEMP, minval=0)
         self.dynamic_fan_control = config.getint('dynamic_fan_control', 1, minval=0, maxval=1)
@@ -257,6 +261,7 @@ class Purifier:
         self.preheat_check_last_temp = None
         self.preheat_check_timeout_time = None
         self.cool_check_last_temp = None
+        self.cool_check_last_adjust_temp = None
         self.cool_check_timeout_time = None
         self.dynamic_fan_power_adjust_time = None
         self.exception_manager = None
@@ -267,6 +272,10 @@ class Purifier:
         self.fan_fault_reported = False
         self.critical_temp_reported = False
         self.print_stats = None
+
+        self.is_print_task_delay_turnoffing_inner = False
+        self.is_print_task_delay_turnoffing_exhaust = False
+        self.last_print_task_purifier_mode = MODE_IDLE
 
         # gcode
         self.gcode = self.printer.lookup_object("gcode")
@@ -281,10 +290,11 @@ class Purifier:
 
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
         self.printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
+        self.printer.register_event_handler("gcode:request_restart", self._handle_shutdown)
         self.printer.register_event_handler("pause_resume:pause", self._reset_preheat_state)
-        self.printer.register_event_handler("pause_resume:cancel", self._reset_exception_reporting_state)
-        self.printer.register_event_handler('print_stats:stop', self._reset_exception_reporting_state)
-        self.printer.register_event_handler('print_stats:start', self._reset_exception_reporting_state)
+        self.printer.register_event_handler("pause_resume:cancel", self._handle_cancel_print_job)
+        self.printer.register_event_handler('print_stats:stop', self._handle_stop_print_job)
+        self.printer.register_event_handler('print_stats:start', self._handle_start_print_job)
 
     def _handle_ready(self):
         self.timer_execution_counter = 0
@@ -292,7 +302,9 @@ class Purifier:
         self.exception_manager = self.printer.lookup_object('exception_manager', None)
         self.v_sd = self.printer.lookup_object('virtual_sdcard', None)
         self.print_stats = self.printer.lookup_object('print_stats', None)
-    def _handle_shutdown(self):
+        self.reactor.update_timer(self._work_time_monitor_timer, self.reactor.monotonic() + 1)
+
+    def _handle_shutdown(self, eventtime=None):
         self.reactor.update_timer(self._work_time_monitor_timer, self.reactor.NEVER)
         self.reactor.update_timer(self._inner_delay_timer, self.reactor.NEVER)
         self.reactor.update_timer(self._exhaust_delay_timer, self.reactor.NEVER)
@@ -302,11 +314,22 @@ class Purifier:
         self.preheat_check_last_temp = None
         self.preheat_check_timeout_time = None
 
+    def _handle_start_print_job(self):
+        self._reset_exception_reporting_state()
+        self.last_print_task_purifier_mode = self.purifier_mode
+
+    def _handle_stop_print_job(self):
+        self._reset_exception_reporting_state()
+
+    def _handle_cancel_print_job(self):
+        self._reset_exception_reporting_state()
+
     def _reset_exception_reporting_state(self):
         self.fan_fault_reported = False
         self.critical_temp_reported = False
         self.fan_rpm_fault_counter = 0
         self.cool_check_last_temp = None
+        self.cool_check_last_adjust_temp = None
         self.cool_check_timeout_time = None
         self.preheat_check_last_temp = None
         self.preheat_check_timeout_time = None
@@ -339,22 +362,57 @@ class Purifier:
             self.power_det_debounce_count = 0
 
     def _work_time_monitor_timer_cb(self, eventtime):
-        if self._inner_fan_state != FAN_STATE_TURN_OFF:
-            if self._inner_last_turn_on_time is None:
-                self._inner_last_turn_on_time = self.reactor.monotonic()
-            else:
-                current_time = self.reactor.monotonic()
-                if current_time > self._inner_last_turn_on_time:
-                    self.config_info['inner_work_time'] += current_time - self._inner_last_turn_on_time
-                self._inner_last_turn_on_time = current_time
+        need_save = False
+        try:
+            update_mode = 0
 
+            if self._inner_fan_state != FAN_STATE_TURN_OFF:
+                if self.print_stats is not None:
+                    if self.print_stats.state not in ['printing', 'paused']:
+                        if self.is_print_task_delay_turnoffing_inner == False:
+                            update_mode = 1
+                        else:
+                            if self.last_print_task_purifier_mode in [MODE_PREHEAT_CHAMBER, MODE_HOT_CHAMBER]:
+                                update_mode = 2
+                            else:
+                                update_mode = 1
+                    else:
+                        if self.purifier_mode in [MODE_PREHEAT_CHAMBER, MODE_HOT_CHAMBER]:
+                            update_mode = 2
+                        else:
+                            update_mode = 1
+                else:
+                    if self.purifier_mode in [MODE_PREHEAT_CHAMBER, MODE_HOT_CHAMBER]:
+                        update_mode = 2
+                    else:
+                        update_mode = 1
+            else:
+                update_mode = 1
+
+            current_time = self.reactor.monotonic()
+            if update_mode == 2:
+                if self._inner_last_turn_on_time is None:
+                    self._inner_last_turn_on_time = current_time
+                else:
+                    if current_time > self._inner_last_turn_on_time:
+                        self.config_info['inner_work_time'] += current_time - self._inner_last_turn_on_time
+                        need_save = True
+                    self._inner_last_turn_on_time = current_time
+
+            else:
+                if self._inner_last_turn_on_time is not None:
+                    if current_time > self._inner_last_turn_on_time:
+                        self.config_info['inner_work_time'] += current_time - self._inner_last_turn_on_time
+                        need_save = True
+                    self._inner_last_turn_on_time = None
+
+            return self.reactor.monotonic() + DEFAULT_WORK_TIME_UPDATE_INTERVAL
+
+        finally:
+            if need_save:
                 if not self.printer.update_snapmaker_config_file(self.config_path,
                             self.config_info, DEFAULT_PURIFIER_CONFIG):
                     logging.error("[purifier] save purifier failed\r\n")
-            return self.reactor.monotonic() + DEFAULT_WORK_TIME_UPDATE_INTERVAL
-        else:
-            self._inner_last_turn_on_time = None
-            return self.reactor.NEVER
 
     def _set_power_enable(self, print_time):
         if self._power_enable_pin is None:
@@ -401,6 +459,7 @@ class Purifier:
         print_time += 0.01
         self._set_power_enable(print_time)
         self.last_print_time = print_time
+        self.is_print_task_delay_turnoffing_exhaust = False
 
     def set_inner_fan_speed(self, speed):
         if not self._power_detected and speed > 0:
@@ -422,21 +481,6 @@ class Purifier:
         else:
             self._inner_fan_state = FAN_STATE_TURN_ON
 
-        if self._inner_fan_state == FAN_STATE_TURN_ON:
-            if self._inner_last_turn_on_time is None:
-                self._inner_last_turn_on_time = self.reactor.monotonic()
-                self.reactor.update_timer(self._work_time_monitor_timer, self.reactor.monotonic() + DEFAULT_WORK_TIME_UPDATE_INTERVAL)
-        else:
-            self.reactor.update_timer(self._work_time_monitor_timer, self.reactor.NEVER)
-            if self._inner_last_turn_on_time is not None:
-                current_time = self.reactor.monotonic()
-                if current_time > self._inner_last_turn_on_time:
-                    self.config_info['inner_work_time'] += current_time - self._inner_last_turn_on_time
-                    if not self.printer.update_snapmaker_config_file(self.config_path,
-                                self.config_info, DEFAULT_PURIFIER_CONFIG):
-                        logging.error("[purifier] save purifier failed\r\n")
-                self._inner_last_turn_on_time = None
-
         system_time = self.reactor.monotonic()
         system_time += FAN_MIN_TIME
         print_time = self._inner_fan.get_mcu().estimated_print_time(system_time)
@@ -445,13 +489,26 @@ class Purifier:
         print_time += 0.01
         self._set_power_enable(print_time)
         self.last_print_time = print_time
+        self.is_print_task_delay_turnoffing_inner = False
+
+        if self._inner_fan_state == FAN_STATE_TURN_ON:
+            if self._inner_last_turn_on_time is None:
+                if self.purifier_mode in [MODE_PREHEAT_CHAMBER, MODE_HOT_CHAMBER]:
+                    if self.print_stats is None or \
+                       self.print_stats.state in ['printing', 'paused']:
+                        self._inner_last_turn_on_time = system_time
+        else:
+            if self._inner_last_turn_on_time is not None:
+                self.reactor.update_timer(self._work_time_monitor_timer, self.reactor.NOW)
 
     def _exhaust_delay_timer_cb(self, eventtime):
         self.set_exhaust_fan_speed(0)
+        self.is_print_task_delay_turnoffing_exhaust = False
         return self.reactor.NEVER
 
     def _inner_delay_timer_cb(self, eventtime):
         self.set_inner_fan_speed(0)
+        self.is_print_task_delay_turnoffing_inner = False
         return self.reactor.NEVER
 
     def _periodic_status_check(self, eventtime):
@@ -467,11 +524,11 @@ class Purifier:
             handler = mode_handlers.get(self.purifier_mode)
             if handler:
                 handler(eventtime)
-        except Exception as e:
+        except Exception:
             self._reset_preheat_state()
-            raise
-        finally:
-            return eventtime + self.check_interval
+            logging.exception("[purifier] periodic status check error")
+
+        return eventtime + self.check_interval
 
     def _pause_print(self):
         self._reset_preheat_state()
@@ -510,6 +567,12 @@ class Purifier:
             self.fan_fault_reported = True
             msg = "Inner fan fault detected: fan is enabled but RPM is 0!"
             self.printer.raise_structured_code_exception("0002-0533-0000-0000", msg)
+            self.printer.send_event("print_stats:update_exception_info",
+                                    533,
+                                    0,
+                                    0,
+                                    msg,
+                                    2)
             self._pause_print()
             return
 
@@ -520,7 +583,7 @@ class Purifier:
             # Reset if temperature is above desired or timeout reached
             if ((self.average_temperature is not None and
                  self.desired_chamber_temp > 0 and
-                 self.average_temperature > self.desired_chamber_temp) or
+                 self.average_temperature >= self.desired_chamber_temp) or
                 eventtime > self.preheat_check_timeout_time):
                 self._reset_preheat_state()
     def _update_temperature_data(self, eventtime):
@@ -536,71 +599,125 @@ class Purifier:
                     self.average_temperature = sum(self.temp_readings) / len(self.temp_readings)
         except Exception as e:
             logging.error("[purifier] Failed to update chamber temperature data: %s", str(e))
-    def _handle_cool_chamber_mode(self, eventtime):
-        # current_temp_str = f"{self.average_temperature:.2f}" if self.average_temperature is not None else "Unknown"
-        # inner_fan_speed = self._inner_fan.get_speed() if self._inner_fan else 0
-        # exhaust_fan_speed = self._exhaust_fan.get_speed() if self._exhaust_fan else 0
-        # self.gcode.respond_info(f"[purifier] handle_cool_chamber_mode - Current: {current_temp_str}°C, "
-        #                        f"\nInner Fan Speed: {inner_fan_speed}, Exhaust Fan Speed: {exhaust_fan_speed}, "
-        #                        f"\nDesired Temp: {self.desired_chamber_temp}°C, Critical Temp: {self.critical_chamber_temp}°C, "
-        #                        f"\nDynamic Control: {self.dynamic_fan_control}, Preheat Wait: {self.preheat_wait_enabled}, "
-        #                        f"\nCool Check Last Temp: {self.cool_check_last_temp}, Cool Timeout: {self.cool_check_timeout_time}, "
-        #                        f"\nCritical Reported: {self.critical_temp_reported}")
-        # Automatically turn off inner fan if it's running in current mode
-        if self._inner_fan is not None and self._inner_fan.get_speed() != 0:
-            self.set_inner_fan_speed(0)
+    def _trigger_cooling_alarm(self):
+        current_temp = self.average_temperature if self.average_temperature is not None else "Unknown"
+        self.critical_temp_reported = True
+        msg = ("Chamber temperature is too high! \n"
+            "Current temperature: %s, Critical temperature: %.2f") % (current_temp, self.critical_chamber_temp)
+        msg = "Failed to cool chamber temperature: %s" % msg
+        self.printer.raise_structured_code_exception("0002-0533-0000-0001", msg)
+        self.printer.send_event("print_stats:update_exception_info",
+                                533,
+                                0,
+                                1,
+                                msg,
+                                2)
+        self._pause_print()
 
+    def _handle_cool_chamber_mode(self, eventtime):
         if (self.external_temp_sensor is not None and
             self.average_temperature is not None and
             self._exhaust_fan is not None):
             exhaust_fan_speed = self._exhaust_fan.get_speed()
+            target_speed = exhaust_fan_speed
             exhaust_fan_max_power = self._exhaust_fan.get_max_power()
             if self.desired_chamber_temp and self.desired_chamber_temp > 0:
                 if not self.critical_temp_reported:
-                    should_increase_power = False
-                    if (self.cool_check_last_temp is None or self.cool_check_timeout_time is None or
-                        self.dynamic_fan_power_adjust_time is None):
+                    # Initialize tracking variables on first run
+                    if self.cool_check_last_temp is None:
                         self.cool_check_last_temp = self.average_temperature
-                        self.dynamic_fan_power_adjust_time = eventtime + self.dynamic_fan_power_adjust_interval
+                    if self.cool_check_timeout_time is None:
                         self.cool_check_timeout_time = eventtime + self.cool_check_timeout_interval
+                    if self.dynamic_fan_power_adjust_time is None:
+                        self.dynamic_fan_power_adjust_time = eventtime + self.dynamic_fan_power_adjust_interval
+                    if self.cool_check_last_adjust_temp is None:
+                        self.cool_check_last_adjust_temp = self.average_temperature
 
-                    if self.cool_check_last_temp > self.average_temperature:
-                        self.cool_check_last_temp = self.average_temperature
+                    # --- Fan speed control ---
+                    # Asymmetric strategy, evaluated at power_adjust_interval:
+                    #   Above critical: always full speed
+                    #   Rising:  linear [desired, critical] → [current, max], 5% resolution
+                    #   Falling: decrease by 10%, min at threshold
+                    # Uses cool_check_last_adjust_temp for direction detection to avoid
+                    # 1-second noise: compares current temp to temp at last adjustment
+                    if self.dynamic_fan_control and eventtime > self.dynamic_fan_power_adjust_time:
                         self.dynamic_fan_power_adjust_time = eventtime + self.dynamic_fan_power_adjust_interval
-                        self.cool_check_timeout_time = eventtime + self.cool_check_timeout_interval
+                        min_speed = self.exhaust_fan_speed_threshold
+                        max_speed = exhaust_fan_max_power
+                        lower_bound = self.desired_chamber_temp
+                        upper_bound = self.critical_chamber_temp
+
+                        if self.average_temperature >= self.critical_chamber_temp:
+                            # Above critical: always full speed
+                            target_speed = max_speed
+                        elif self.average_temperature > self.cool_check_last_adjust_temp:
+                            # Temperature rising: linear from current to max, 5% resolution
+                            # Floor at min_speed so manually lowered speed recovers
+                            if upper_bound <= lower_bound:
+                                target_speed = max_speed if self.average_temperature >= lower_bound else max(exhaust_fan_speed, min_speed)
+                            elif self.average_temperature <= lower_bound:
+                                if self.average_temperature < lower_bound - self.cooling_fan_power_start_increment:
+                                    target_speed = exhaust_fan_speed
+                                else:
+                                    target_speed = max(exhaust_fan_speed, min_speed)
+                            elif self.average_temperature >= upper_bound:
+                                target_speed = max_speed
+                            else:
+                                ratio = (self.average_temperature - lower_bound) / (upper_bound - lower_bound)
+                                target_speed = max(exhaust_fan_speed, min_speed) + ratio * (max_speed - max(exhaust_fan_speed, min_speed))
+                            target_speed = round(target_speed / 0.01) * 0.01
+                            target_speed = min(target_speed, max_speed)
+                        elif self.average_temperature < self.cool_check_last_adjust_temp:
+                            # Temperature falling: decrease by 10%, min at threshold
+                            if self.average_temperature < lower_bound:
+                                if exhaust_fan_speed > min_speed:
+                                    target_speed = round(max(min_speed, exhaust_fan_speed - self.dynamic_fan_power_decrement), 2)
+                        else:
+                            target_speed = exhaust_fan_speed
+
+                        if target_speed == exhaust_fan_speed:
+                            if self.average_temperature < lower_bound - self.cooling_fan_power_start_increment:
+                                if exhaust_fan_speed > min_speed:
+                                    target_speed = round(max(min_speed, exhaust_fan_speed - self.dynamic_fan_power_decrement), 2)
+
+
+                        if abs(target_speed - exhaust_fan_speed) > 0.01:
+                            logging.info(
+                                "[purifier] Adjusting exhaust fan speed from %.2f to %.2f, "
+                                "temp=%.2f, desired=%.2f, critical=%.2f" %
+                                (exhaust_fan_speed, target_speed,
+                                 self.average_temperature, self.desired_chamber_temp,
+                                 self.critical_chamber_temp))
+                            self.set_exhaust_fan_speed(target_speed)
+
+                        self.cool_check_last_adjust_temp = self.average_temperature
+
+                    prev_temp = self.cool_check_last_temp
+                    if self.average_temperature < self.cool_check_last_temp:
+                        self.cool_check_last_temp = self.average_temperature
+
+                    # --- Critical alarm logic ---
+                    if self.average_temperature > self.critical_chamber_temp:
+                        if self.preheat_wait_enabled:
+                            # WAIT_CHAMBER_TEMP mode: check downward trend
+                            if self.average_temperature < prev_temp:
+                                # Downward trend: reset timeout, continue waiting
+                                self.cool_check_timeout_time = eventtime + self.cool_check_timeout_interval
+                            elif eventtime >= self.cool_check_timeout_time:
+                                # No downward trend + timeout → alarm
+                                self._trigger_cooling_alarm()
+                                return
+                        else:
+                            # Non-WAIT mode: simple timeout check
+                            if eventtime >= self.cool_check_timeout_time:
+                                self._trigger_cooling_alarm()
+                                return
                     else:
-                        if self.average_temperature < self.critical_chamber_temp:
-                            self.cool_check_timeout_time = eventtime + self.cool_check_timeout_interval
-
-                        if self.average_temperature <= self.desired_chamber_temp - self.cooling_activation_offset:
-                            self.dynamic_fan_power_adjust_time = eventtime + self.dynamic_fan_power_adjust_interval
-
-                    if eventtime > self.dynamic_fan_power_adjust_time:
-                        self.dynamic_fan_power_adjust_time = eventtime + self.dynamic_fan_power_adjust_interval
-                        if (self.dynamic_fan_control and
-                            self.average_temperature > self.desired_chamber_temp - self.cooling_activation_offset and
-                            exhaust_fan_speed < exhaust_fan_max_power):
-                            should_increase_power = True
-
-                    if eventtime >= self.cool_check_timeout_time and not self.critical_temp_reported:
-                        current_temp = self.average_temperature if self.average_temperature is not None else "Unknown"
-                        self.critical_temp_reported = True
-                        msg = ("Chamber temperature is too high! \n"
-                            "Current temperature: %s, Critical temperature: %.2f") % (current_temp, self.critical_chamber_temp)
-                        self._pause_print()
-                        msg = "Failed to cool chamber temperature: %s" % msg
-                        self.printer.raise_structured_code_exception("0002-0533-0000-0001", msg)
-                        return
-
-                    if should_increase_power and exhaust_fan_speed < exhaust_fan_max_power and self.dynamic_fan_control:
-                        new_speed = round(min(exhaust_fan_speed + self.dynamic_fan_power_increment,
-                                    exhaust_fan_max_power), 2)
-                        logging.info("[purifier] Increasing exhaust fan speed from %.2f to %.2f, temp: previous=%.2f, current=%.2f",
-                                     exhaust_fan_speed, new_speed, self.cool_check_last_temp, self.average_temperature)
-                        self.set_exhaust_fan_speed(new_speed)
-                        self.cool_check_last_temp = self.average_temperature
+                        # Temperature below critical: reset timeout
+                        self.cool_check_timeout_time = eventtime + self.cool_check_timeout_interval
                 else:
                     self.cool_check_last_temp = None
+                    self.cool_check_last_adjust_temp = None
                     self.cool_check_timeout_time = None
                     self.dynamic_fan_power_adjust_time = None
 
@@ -645,6 +762,12 @@ class Purifier:
         if fault_detected and not self.fan_fault_reported:
             msg = "Inner fan fault detected: fan is enabled but RPM is 0!"
             self.printer.raise_structured_code_exception("0002-0533-0000-0000", msg)
+            self.printer.send_event("print_stats:update_exception_info",
+                                    533,
+                                    0,
+                                    0,
+                                    msg,
+                                    2)
             self.fan_fault_reported = True
             self._pause_print()
             return
@@ -682,6 +805,7 @@ class Purifier:
         self.fan_fault_reported = False
         self.critical_temp_reported = False
         self.cool_check_last_temp = None
+        self.cool_check_last_adjust_temp = None
         self.cool_check_timeout_time = None
         self.dynamic_fan_power_adjust_time = None
         self.exhaust_fan_speed_threshold = 0
@@ -689,6 +813,7 @@ class Purifier:
 
     def set_exhaust_fan_delay_turn_off(self, delay):
         if self._exhaust_fan_state == FAN_STATE_TURN_OFF:
+            self.is_print_task_delay_turnoffing_exhaust = False
             return
 
         if delay < 1:
@@ -696,9 +821,11 @@ class Purifier:
         else:
             self._exhaust_fan_state = FAN_STATE_TURNING_OFF
             self.reactor.update_timer(self._exhaust_delay_timer, self.reactor.monotonic() + delay)
+            self.is_print_task_delay_turnoffing_exhaust = True
 
     def set_inner_fan_delay_turn_off(self, delay):
         if self._inner_fan_state == FAN_STATE_TURN_OFF:
+            self.is_print_task_delay_turnoffing_inner = False
             return
 
         if delay < 1:
@@ -706,6 +833,7 @@ class Purifier:
         else:
             self._inner_fan_state = FAN_STATE_TURNING_OFF
             self.reactor.update_timer(self._inner_delay_timer, self.reactor.monotonic() + delay)
+            self.is_print_task_delay_turnoffing_inner = True
 
     def get_status(self, eventtime):
         exhaust_fan_status = None
@@ -717,18 +845,25 @@ class Purifier:
 
         status_dict = {
             'power_detected': self._power_detected,
-            'power_det_value': round(self._power_det_value * 3.3, 2),
+            'power_det_value': round(self._power_det_value * 3.3, 1),
             'mode': self.purifier_mode,
+            'desired_chamber_temp': self.desired_chamber_temp,
+            'critical_chamber_temp': self.critical_chamber_temp,
         }
+        if self._inner_fan is not None:
+            status_dict.update({'inner_fan_work_time': round(self.config_info['inner_work_time'], 1)})
+            if 'rpm' in inner_fan_status:
+                status_dict.update({'inner_fan_rpm': inner_fan_status['rpm']})
 
         if exhaust_fan_status is not None:
-            status_dict.update({'exhaust_fan': exhaust_fan_status})
+            status_dict.update({'exhaust_fan': {}})
+            status_dict['exhaust_fan'].update({'speed': exhaust_fan_status['speed']})
             status_dict['exhaust_fan'].update({'delay': self.config_info['exhaust_delay_time']})
             status_dict['exhaust_fan'].update({'speed_threshold': self.exhaust_fan_speed_threshold})
         if inner_fan_status is not None:
-            status_dict.update({'inner_fan': inner_fan_status})
+            status_dict.update({'inner_fan': {}})
+            status_dict['inner_fan'].update({'speed': inner_fan_status['speed']})
             status_dict['inner_fan'].update({'delay': self.config_info['inner_delay_time']})
-            status_dict['inner_fan'].update({'work': round(self.config_info['inner_work_time'], 2)})
             status_dict['inner_fan'].update({'speed_threshold': self.inner_fan_speed_threshold})
 
         return status_dict
@@ -739,6 +874,8 @@ class Purifier:
             speed = web_request.get_int('speed', None)
             delay = web_request.get_int('delay', None)
             work = web_request.get_int('work', None)
+            skip_delay = web_request.get_int('skip_delay', 1)
+            logging.info(f"[purifier] wb, control_purifier: {web_request.get_raw_parameters()}")
 
             need_save = False
 
@@ -760,7 +897,10 @@ class Purifier:
                     if speed > 0:
                         self.set_exhaust_fan_speed(speed / 100.0)
                     else:
-                        self.set_exhaust_fan_delay_turn_off(delay)
+                        if skip_delay != 0:
+                            self.set_exhaust_fan_speed(0)
+                        else:
+                            self.set_exhaust_fan_delay_turn_off(delay)
 
             elif fan == 'inner':
                 if delay != None:
@@ -777,7 +917,10 @@ class Purifier:
                     if speed > 0:
                         self.set_inner_fan_speed(speed / 100.0)
                     else:
-                        self.set_inner_fan_delay_turn_off(delay)
+                        if skip_delay != 0:
+                            self.set_inner_fan_speed(0)
+                        else:
+                            self.set_inner_fan_delay_turn_off(delay)
 
             else:
                 pass
@@ -908,6 +1051,7 @@ class Purifier:
         self.dynamic_fan_control = dynamic_fan_control
         self.set_exhaust_fan_speed(fan_speed)
         self.set_inner_fan_speed(0)
+        self.config_info['inner_delay_time'] = 0
         self.exhaust_fan_speed_threshold = fan_speed
         self.purifier_mode = MODE_COOL_CHAMBER
         if delay_off is not None:
@@ -928,6 +1072,7 @@ class Purifier:
         self._reset_chamber_mode()
         self.set_inner_fan_speed(fan_speed)
         self.set_exhaust_fan_speed(0)
+        self.config_info['exhaust_delay_time'] = 0
         self.desired_chamber_temp = desired_temp
         self.purifier_mode = MODE_PREHEAT_CHAMBER
         self.inner_fan_speed_threshold = fan_speed
@@ -948,6 +1093,7 @@ class Purifier:
         self._reset_chamber_mode()
         self.set_inner_fan_speed(fan_speed)
         self.set_exhaust_fan_speed(0)
+        self.config_info['exhaust_delay_time'] = 0
         self.desired_chamber_temp = desired_temp
         self.purifier_mode = MODE_HOT_CHAMBER
         self.inner_fan_speed_threshold = fan_speed
@@ -981,6 +1127,9 @@ class Purifier:
                     mode_handlers[mode](gcmd)
                 finally:
                     self.reactor.update_timer(self._periodic_check_timer, self.reactor.NOW)
+            if self.print_stats is not None:
+                if self.print_stats.state in ['printing', 'paused']:
+                    self.last_print_task_purifier_mode = self.purifier_mode
         except Exception as e:
             raise
     def cmd_WAIT_CHAMBER_TEMP(self, gcmd):

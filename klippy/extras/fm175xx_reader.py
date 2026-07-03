@@ -240,14 +240,14 @@ class FM175XXReader:
 
         self.__printer.register_event_handler("klippy:ready", self.__ready)
         self.__printer.register_event_handler("klippy:shutdown", self.__shutdown)
-        self.__printer.register_event_handler("klippy:firmware_restart", self.__shutdown)
+        self.__printer.register_event_handler("gcode:request_restart", self.__shutdown)
 
     def __ready(self):
         # Threading
         background_thread = threading.Thread(target=self.__bg_thread)
         background_thread.start()
 
-    def __shutdown(self):
+    def __shutdown(self, eventtime=None):
         self.__stop_event.set()
         try:
             self.__soc_rst_pin.release()
@@ -303,14 +303,14 @@ class FM175XXReader:
     def __register_read(self, addr:int) -> int:
         addr = (addr << 1) | 0x80
         to_send = [addr, 0x00]
-        reg_data = self.__spi.xfer(to_send)
+        reg_data = self.__spi.xfer2(to_send)
         return reg_data[1]
 
     # write register
     def __register_write(self, addr:int, reg_data:int) -> None:
         addr = (addr << 1) & 0x7E
         to_send = [addr, reg_data]
-        self.__spi.xfer(to_send)
+        self.__spi.xfer2(to_send)
 
     # modify register
     def __register_modify(self, addr:int, mask:int, is_set:int) -> None:
@@ -326,14 +326,14 @@ class FM175XXReader:
     # read FIFO
     def __fifo_read(self, len:int) -> list:
         addr = [0x92] * len + [0x00]
-        buff = self.__spi.xfer(addr)
+        buff = self.__spi.xfer2(addr)
         return buff[1 : len + 1]
 
     # write FIFO
     def __fifo_write(self, len:int, buff:list) -> None:
         to_write = [0x12]
         to_write += buff[0:len]
-        self.__spi.xfer(to_write)
+        self.__spi.xfer2(to_write)
 
     # Enable/Disable CRC check generation during data transmission.
     def __set_send_crc(self, mode:int) -> None:
@@ -667,7 +667,7 @@ class FM175XXReader:
 
         ret = self.__reader_a_wakeup()
         if (FM175XX_OK != ret):
-            logging.error("wakeup err: %d", ret)
+            # logging.error("wakeup err: %d", ret)
             return FM175XX_CARD_WAKEUP_ERR
 
         if ((self.__picc_a.ATQA[0] & 0xC0) == 0x00):
@@ -683,12 +683,12 @@ class FM175XXReader:
             self.__picc_a.CASCADE_LEVEL = i
             ret = self.__reader_a_anticoll(self.__picc_a.CASCADE_LEVEL)
             if (FM175XX_OK != ret):
-                logging.error("anticoll err: %d", ret)
+                # logging.error("anticoll err: %d", ret)
                 ret = FM175XX_CARD_COLL_ERR
                 break
             ret = self.__reader_a_select(self.__picc_a.CASCADE_LEVEL)
             if (FM175XX_OK != ret):
-                logging.error("select err: %d", ret)
+                # logging.error("select err: %d", ret)
                 ret = FM175XX_CARD_SELECT_ERR
                 break
 
@@ -870,9 +870,9 @@ class FM175XXReader:
             if self.__stop_event.is_set():
                 break
 
-            retry_times_1 = 10
-            retry_times_2 = 15
-            retry_times_3 = 10
+            retry_times_1 = 6
+            retry_times_2 = 8
+            retry_times_3 = 6
             if (self.__self_test_stage == FM175XX_SELF_TEST_STAGE_READY):
                 self.__card_info_read_flag = (1 << self.__self_test_channel)
                 self.__card_info_clear_flag = 0
@@ -924,6 +924,7 @@ class FM175XXReader:
                             ret = self.__reader_a_activate()
                             if (FM175XX_OK == ret):
                                 break
+                            self.__stop_event.wait(0.15)
                         if (FM175XX_OK != ret):
                             logging.error("Activate M1 card err, ret = %d", ret)
                             card_op_result = FM175XX_CARD_ACTIVATE_ERR

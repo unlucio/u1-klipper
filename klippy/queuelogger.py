@@ -15,7 +15,7 @@ class MillisecondFormatter(logging.Formatter):
         if datefmt:
             s = time.strftime(datefmt, ct)
         else:
-            s = time.strftime("%H:%M:%S", ct)
+            s = time.strftime("%m-%d %H:%M:%S", ct)
         return "%s.%03d" % (s, (record.msecs % 1000))
 
 # Class to forward all messages through a queue to a background thread

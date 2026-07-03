@@ -176,10 +176,6 @@ class RunoutHelper:
         self.config['enable'] = bool(self.sensor_enabled)
         logging.info("Filament Sensor: set enable/disable -- %d", self.sensor_enabled)
 
-        print_task_config = self.printer.lookup_object('print_task_config', None)
-        if print_task_config is not None:
-            print_task_config.update_filament_flags()
-
         need_save = gcmd.get_int('SAVE', 1, minval=0, maxval=1)
         if (need_save):
             load_config = self.printer.load_snapmaker_config_file(self.config_path, DEFAULT_CONFIG)

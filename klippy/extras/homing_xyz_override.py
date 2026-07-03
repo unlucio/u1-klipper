@@ -154,7 +154,7 @@ class HomingXYZOverride:
             pass
         elif activate_status[0][1] == 0 or activate_status[0][1] == 1 or retry_extruder_id is not None:
             # The extruder status does not match the actual state, need to retrieve the extruder status once
-            gcmd = self.gcode.create_gcode_command("", "", {})
+            gcmd = self.gcode.create_gcode_command("", "", {"A": 0})
             extruder = self.printer.lookup_object(activate_status[0][0], None)
             if extruder is not None:
                 cur_extruder = extruder

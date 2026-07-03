@@ -50,23 +50,20 @@ class Printer:
             return os.path.expanduser("~")
     def set_extruder_power(self, state, extruder=['all']):
         """Set the extruder power state."""
-        import multiprocessing
-        # run command "lava_io set HEAD_MCU_POWER=on_off" with os.system
         try:
             if state == 'on':
                 logging.info("Setting extruder power ON")
-                ps = 1
                 os.system("lava_io set HEAD_MCU_POWER=0 HEAD_MCU0_BOOT=1 HEAD_MCU1_BOOT=1 HEAD_MCU2_BOOT=1 HEAD_MCU3_BOOT=1")
                 time.sleep(0.2)
-            else:
+                os.system("lava_io set HEAD_MCU_POWER=1")
+            elif state == 'off':
                 logging.info("Setting extruder power OFF")
-                ps = 0
-            cmd = f"lava_io set HEAD_MCU_POWER={ps}"
-            p = multiprocessing.Process(target=os.system, args=(cmd,))
-            p.daemon = True  # Ensure the process exits when the main program exits
-            p.start()
+                os.system("lava_io set HEAD_MCU_POWER=0")
+            else:
+                logging.error("Invalid state: %s" % (state,))
+                return False
         except Exception as e:
-            logging.error(f"Failed to set extruder power: {e}")
+            logging.error("Failed to set extruder power: %s" % (str(e),))
             return False
         return True
     def set_main_mcu_power(self, state):
@@ -427,12 +424,20 @@ class Printer:
                 if f"{mcu_str}" in f"{err_info}":
                     mcu_index = index
                     break
-            # When e0 is not connected, it is also necessary to confirm whether other heads exist
             if mcu_index == 2:
-                serial_devices = printer_device_scan.run_shell_command("ls /dev/serial/by-path/")
-                if serial_devices[0] != 0:
-                    mcu_index = 100
-                    err_info += ", All extruders not detected"
+                usb_info = printer_device_scan.run_shell_command("lsusb")
+                hub_count = 0
+                if usb_info[0] == 0:
+                    hub_count = usb_info[1].count("QinHeng Electronics USB HUB")
+                if hub_count < 2:
+                    mcu_index = 101
+                    err_info += ", USB HUB not detected (%d/2)" % hub_count
+                else:
+                    serial_devices = printer_device_scan.run_shell_command(
+                        "ls /dev/serial/by-path/")
+                    if serial_devices[0] != 0:
+                        mcu_index = 100
+                        err_info += ", All extruders not detected (hub OK)"
             coded, oneshot, message, is_persistent = f"0003-0522-{mcu_index:04d}-0006", 0, err_info, 0
             message = self.extract_coded_message_field(message)
             err_msg = json.dumps({
@@ -712,8 +717,10 @@ def main():
                     help="run as user (default: lava)")
     opts.add_option("-f", "--factory", dest="factory_mode", action="store_true",
                     help="enable factory mode")
+    opts.add_option("--minor-core", dest="minor_core", type="string", default="2,3",
+                    help="comma-separated CPU cores for background calculations (e.g. 2,3)")
     options, args = opts.parse_args()
-    switch_user_group(options.run_user)
+    # switch_user_group(options.run_user)
     if options.import_test:
         import_test()
     if len(args) != 1:
@@ -721,7 +728,9 @@ def main():
     start_args = {'config_file': args[0], 'apiserver': options.apiserver,
                   'start_reason': 'startup'}
     start_args["factory_mode"] = True if options.factory_mode else False
-
+    if options.minor_core:
+        start_args["minor_core"] = set(
+            int(c.strip()) for c in options.minor_core.split(','))
     debuglevel = logging.INFO
     if options.verbose:
         debuglevel = logging.DEBUG
@@ -805,5 +814,4 @@ def main():
         sys.exit(-1)
 
 if __name__ == '__main__':
-    set_sched_fifo()
     main()

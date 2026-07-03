@@ -89,12 +89,13 @@ class Heater:
             # No significant change in value - can suppress update
             return
         pwm_time = read_time + self.pwm_delay
+        min_pwm_time = self.mcu_pwm.get_mcu().estimated_print_time(
+            self.printer.get_reactor().monotonic()) + 0.5 * self.pwm_delay
+        if pwm_time < min_pwm_time:
+            pwm_time = min_pwm_time
         self.next_pwm_time = pwm_time + 0.5 * MAX_HEAT_TIME
         self.last_pwm_value = value
         self.mcu_pwm.set_pwm(pwm_time, value)
-        #logging.debug("%s: pwm=%.3f@%.3f (from %.3f@%.3f [%.3f])",
-        #              self.name, value, pwm_time,
-        #              self.last_temp, self.last_temp_time, self.target_temp)
     def temperature_callback(self, read_time, temp):
         with self.lock:
             time_diff = read_time - self.last_temp_time
@@ -157,7 +158,7 @@ class Heater:
         with self.lock:
             self.target_temp = degrees
     def get_temp(self, eventtime):
-        print_time = self.mcu_pwm.get_mcu().estimated_print_time(eventtime) - 5.
+        print_time = self.mcu_pwm.get_mcu().estimated_print_time(eventtime) - 10.
         with self.lock:
             if self.last_temp_time < print_time:
                 return 0., self.target_temp

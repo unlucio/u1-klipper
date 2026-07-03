@@ -49,6 +49,7 @@ class VirtualSD:
         self.sdcard_dirname = os.path.normpath(os.path.expanduser(sd))
         self.current_file = None
         self.file_position = self.file_size = 0
+        self._pl_cache = {}
         # Print Stat Tracking
         self.print_stats = self.printer.load_object(config, 'print_stats')
         # Work timer
@@ -340,6 +341,7 @@ class VirtualSD:
             filename = filename[1:]
         self.rm_power_loss_info()
         self._load_file(gcmd, filename, check_subdirs=True)
+        self.gcode.run_script_from_command("TURN_OFF_HEATERS")
         self.do_resume()
 
     cmd_SDCARD_PRINT_FILE_WITH_PARAMETERS_help = "Loads a SD file and starts the print.  May "\
@@ -361,6 +363,7 @@ class VirtualSD:
             filename = filename[1:]
         self.rm_power_loss_info()
         self._load_file(gcmd, filename, check_subdirs=True)
+        self.gcode.run_script_from_command("TURN_OFF_HEATERS")
         self.do_resume()
 
     def cmd_M20(self, gcmd):
@@ -783,12 +786,9 @@ class VirtualSD:
             logging.info("Force record power loss print file env")
     def get_pl_print_file_env(self):
         if self.pl_switch:
-            if not os.path.exists(self.pl_print_file_env_path):
-                return None
             try:
-                with open(self.pl_print_file_env_path, 'r') as f:
-                    data = json.load(f)
-                return  data
+                data = self._pl_read_file(self.pl_print_file_env_path)
+                return data if data else None
             except Exception as e:
                 logging.exception("Failed to read power loss env file")
                 return None
@@ -821,6 +821,7 @@ class VirtualSD:
                     except Exception as e:
                         logging.warning(f"Failed to delete {p} or {p}.tmp: {e}")
                 self.pl_env_valid = False
+                self._pl_cache.clear()
                 logging.info("rm power_loss info success")
             else:
                 logging.info("klippy is shutdown, power_loss info is not allowed to be removed")
@@ -963,15 +964,9 @@ class VirtualSD:
         self.save_environment_data(self.pl_print_fan_info_env_path, fan_state, sync, flush, safe_write)
 
     def get_pl_print_fan_env(self):
-        if not os.path.exists(self.pl_print_fan_info_env_path):
-            return None
         try:
-            # Read and parse file content
-            with open(self.pl_print_fan_info_env_path, 'r') as f:
-                file_content = f.read().strip()
-                if not file_content:
-                    return None
-                return json.loads(file_content)
+            data = self._pl_read_file(self.pl_print_fan_info_env_path)
+            return data if data else None
         except Exception as e:
             logging.exception("Failed to read print_fan info from file")
             return None
@@ -1006,12 +1001,9 @@ class VirtualSD:
         except Exception as e:
             logging.exception("Failed to record print objects environment: %s" % str(e))
     def get_pl_print_objects_env(self):
-        if not os.path.exists(self.pl_print_objects_env_path):
-            return []
         try:
-            with open(self.pl_print_objects_env_path, 'r') as f:
-                data = json.load(f)
-            return data['objects']
+            data = self._pl_read_file(self.pl_print_objects_env_path)
+            return data.get('objects', []) if data else []
         except Exception as e:
             logging.exception("Failed to read print objects environment: %s" % str(e))
             return []
@@ -1027,12 +1019,9 @@ class VirtualSD:
         except Exception as e:
             logging.exception("Failed to record print exclude objects environment: %s" % str(e))
     def get_pl_print_exclude_objects_env(self):
-        if not os.path.exists(self.pl_print_exclude_objects_env_path):
-            return []
         try:
-            with open(self.pl_print_exclude_objects_env_path, 'r') as f:
-                data = json.load(f)
-            return data['excluded_objects']
+            data = self._pl_read_file(self.pl_print_exclude_objects_env_path)
+            return data.get('excluded_objects', []) if data else []
         except Exception as e:
             logging.exception("Failed to read print exclude objects environment: %s" % str(e))
             return []
@@ -1045,14 +1034,9 @@ class VirtualSD:
             logging.exception("Failed to record print purifier environment: %s" % str(e))
     def get_pl_print_purifier_env(self):
         if self.pl_switch:
-            if not os.path.exists(self.pl_print_purifier_env_path):
-                return None
             try:
-                with open(self.pl_print_purifier_env_path, 'r') as f:
-                    file_content = f.read().strip()
-                    if not file_content:
-                        return None
-                    return json.loads(file_content)
+                data = self._pl_read_file(self.pl_print_purifier_env_path)
+                return data if data else None
             except Exception as e:
                 logging.exception("Failed to read print purifier environment")
                 return None
@@ -1311,8 +1295,8 @@ class VirtualSD:
                 if not save_file_list or i not in save_file_list:
                     try:
                         queuefile.sync_delete_file(self.printer.get_reactor(), file_path)
+                        self._pl_cache.pop(file_path, None)
                         total_removed += 1
-                        # logging.info(f"Removed move env file: {file_path}")
                     except Exception as e:
                         failed_files.append(file_path)
                         logging.error(f"Failed to remove move env file {file_path}: {e}")
@@ -1324,31 +1308,42 @@ class VirtualSD:
 
         except Exception as e:
             logging.error(f"Unexpected error in rm_power_loss_move_env: {e}")
-    def save_environment_data(self, file_path, data_dict={}, sync=False, flush=True, safe_write=True):
+
+    def _pl_read_file(self, file_path):
+        """Read PL JSON file via direct I/O."""
+        if os.path.exists(file_path):
+            with open(file_path, 'r') as f:
+                return json.load(f)
+        return {}
+
+    def save_environment_data(self, file_path, data_dict={}, sync=False,
+                              flush=True, safe_write=True):
         if not data_dict:
             return True
-        existing_data = {}
-        if os.path.exists(file_path):
+        if file_path in self._pl_cache:
+            existing_data = self._pl_cache[file_path]
+            existing_data.update(data_dict)
+        else:
             try:
-                with open(file_path, 'r') as f:
-                    existing_data = json.load(f)
+                existing_data = self._pl_read_file(file_path)
             except Exception as e:
-                logging.exception(f"Failed to read environment file: {file_path}")
+                logging.exception("Failed to read environment file: %s" % file_path)
                 return False
+            existing_data.update(data_dict)
 
-        existing_data.update(data_dict)
+        self._pl_cache[file_path] = existing_data
 
         try:
             json_content = dumps(existing_data, indent=2)
             if sync:
                 queuefile.sync_write_file(self.printer.get_reactor(), file_path, json_content,
-                                        flush=flush, safe_write=safe_write)
+                                          flush=flush, safe_write=safe_write)
             else:
                 queuefile.async_write_file(file_path, json_content,
-                                         flush=flush, safe_write=safe_write)
+                                           flush=flush, safe_write=safe_write)
             return True
         except Exception as e:
-            logging.exception(f"Failed to write environment file: {file_path}")
+            logging.exception("Failed to write environment file: %s" % file_path)
             return False
 
     def _valid_power_loss_condition(self):
@@ -1398,15 +1393,12 @@ class VirtualSD:
             current_heaters = [name for name, obj in pheaters.heaters.items()]
         result = {name: 0 for name in current_heaters}
         saved_temps = {}
-        if not os.path.exists(self.pl_print_temperature_env_path):
-            return (result, saved_temps)
         try:
-            with open(self.pl_print_temperature_env_path, 'r') as f:
-                saved_temps = json.load(f)
-
-            for name in current_heaters:
-                if name in saved_temps:
-                    result[name] = saved_temps[name]
+            saved_temps = self._pl_read_file(self.pl_print_temperature_env_path)
+            if saved_temps:
+                for name in current_heaters:
+                    if name in saved_temps:
+                        result[name] = saved_temps[name]
         except Exception as e:
             saved_temps = {}
             logging.exception("Failed to read temperature info, error: {}".format(str(e)))
@@ -1424,15 +1416,14 @@ class VirtualSD:
         self.save_environment_data(self.pl_print_flow_and_speed_factor_env_path, temp_data, sync, flush, safe_write)
 
     def get_pl_print_flow_and_speed_factor(self):
-        if not os.path.exists(self.pl_print_flow_and_speed_factor_env_path):
-            return {'speed_factor': None, 'flow_factor': None, 'speed_factor_bak': None}
         try:
-            with open(self.pl_print_flow_and_speed_factor_env_path, 'r') as f:
-                data = json.load(f)
-                speed = data.get('speed_factor') if isinstance(data, dict) else None
-                flow = data.get('flow_factor') if isinstance(data, dict) else None
-                speed_bak = data.get('speed_factor_bak') if isinstance(data, dict) else None
-                return {'speed_factor': speed, 'flow_factor': flow, 'speed_factor_bak': speed_bak}
+            data = self._pl_read_file(self.pl_print_flow_and_speed_factor_env_path)
+            if not data:
+                return {'speed_factor': None, 'flow_factor': None, 'speed_factor_bak': None}
+            speed = data.get('speed_factor') if isinstance(data, dict) else None
+            flow = data.get('flow_factor') if isinstance(data, dict) else None
+            speed_bak = data.get('speed_factor_bak') if isinstance(data, dict) else None
+            return {'speed_factor': speed, 'flow_factor': flow, 'speed_factor_bak': speed_bak}
         except Exception as e:
             logging.exception("Failed to read flow and speed factor info, error: {}".format(str(e)))
             return {'speed_factor': None, 'flow_factor': None, 'speed_factor_bak': None}
@@ -1453,22 +1444,15 @@ class VirtualSD:
         self.save_environment_data(self.pl_print_pressure_advance_env_path, data_dict_load, sync, flush, safe_write)
 
     def get_pl_print_pressure_advance(self):
-        if not os.path.exists(self.pl_print_pressure_advance_env_path):
-            return None
-
         try:
-            with open(self.pl_print_pressure_advance_env_path, 'r') as f:
-                saved_data = json.load(f)
-                if not isinstance(saved_data, dict):
-                    return None
-
-                extruder_steppers = []
-                for extruder in self.printer.lookup_object('extruder_list', []):
-                    if hasattr(extruder, 'extruder_stepper') and extruder.extruder_stepper is not None:
-                        extruder_steppers.append(extruder.extruder_stepper.name)
-
-                return {k: v for k, v in saved_data.items() if k in extruder_steppers}
-
+            saved_data = self._pl_read_file(self.pl_print_pressure_advance_env_path)
+            if not saved_data or not isinstance(saved_data, dict):
+                return None
+            extruder_steppers = []
+            for extruder in self.printer.lookup_object('extruder_list', []):
+                if hasattr(extruder, 'extruder_stepper') and extruder.extruder_stepper is not None:
+                    extruder_steppers.append(extruder.extruder_stepper.name)
+            return {k: v for k, v in saved_data.items() if k in extruder_steppers}
         except json.JSONDecodeError:
             logging.error("Invalid JSON in pressure advance file")
         except Exception as e:
@@ -1482,12 +1466,9 @@ class VirtualSD:
 
     def get_pl_print_layer_info(self):
         if self.pl_switch:
-            if not os.path.exists(self.pl_print_layer_info_env_path):
-                return None
             try:
-                with open(self.pl_print_layer_info_env_path, 'r') as f:
-                    data = json.load(f)
-                return data
+                data = self._pl_read_file(self.pl_print_layer_info_env_path)
+                return data if data else None
             except Exception as e:
                 logging.exception("Failed to read power loss layer info file")
                 return None
@@ -1513,21 +1494,16 @@ class VirtualSD:
 
     def record_pl_print_z_adjust_position(self, adjust_position, sync=False, flush=True, safe_write=True):
         data = {}
-        if os.path.exists(self.pl_print_z_adjust_position_env_path):
-            try:
-                with open(self.pl_print_z_adjust_position_env_path, 'r') as f:
-                    file_content = f.read().strip()
-                    if file_content:
-                        try:
-                            data = json.loads(file_content)
-                        except json.JSONDecodeError:
-                            self.gcode.respond_info(
-                                "Warning: Invalid JSON in z_adjust_position file, resetting data")
-                            data = {}
-            except Exception as e:
-                self.gcode.respond_info(
-                    f"Warning: Failed to read z_adjust_position file: {str(e)}")
-                data = {}
+        try:
+            data = self._pl_read_file(self.pl_print_z_adjust_position_env_path)
+        except json.JSONDecodeError:
+            self.gcode.respond_info(
+                "Warning: Invalid JSON in z_adjust_position file, resetting data")
+            data = {}
+        except Exception as e:
+            self.gcode.respond_info(
+                f"Warning: Failed to read z_adjust_position file: {str(e)}")
+            data = {}
         if 'z_adjust_position' in data:
             data['z_adjust_position'] += adjust_position
         else:
@@ -1536,10 +1512,9 @@ class VirtualSD:
 
     def get_pl_print_z_adjust_position(self):
         try:
-            if not os.path.exists(self.pl_print_z_adjust_position_env_path):
+            data = self._pl_read_file(self.pl_print_z_adjust_position_env_path)
+            if not data:
                 return 0.0
-            with open(self.pl_print_z_adjust_position_env_path, 'r') as f:
-                data = json.load(f)
             return float(data.get('z_adjust_position', 0.0))
         except Exception as e:
             return 0.0

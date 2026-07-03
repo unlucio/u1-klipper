@@ -429,6 +429,8 @@ class PrinterConfig:
         try:
             f = open(temp_name, 'w')
             f.write(data)
+            f.flush()
+            os.fdatasync(f.fileno())
             f.close()
             os.rename(cfgname, backup_name)
             os.rename(temp_name, cfgname)

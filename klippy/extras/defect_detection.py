@@ -377,18 +377,26 @@ class DefectDetection:
             return
 
         self.last_request_time = self.reactor.monotonic()
-        noodle_detect_threshold = self.noodle_threshold_low
-        if self.config['noodle']['sensitivity'] == SENSITIVITY_HIGH:
-            noodle_detect_threshold = self.noodle_threshold_high
 
-        params = {
-            "labels": ["noodle"],
-            "noodle": {
-                "threshold": noodle_detect_threshold,
-                "sensitivity": self.config['noodle']['sensitivity']
+        labels = []
+        params = {"labels": labels}
+
+        for detect_type in ["noodle", "residue"]:
+            if not self.config[detect_type]['enable']:
+                continue
+            labels.append(detect_type)
+            threshold = getattr(self, f"{detect_type}_threshold_low")
+            if self.config[detect_type]['sensitivity'] == SENSITIVITY_HIGH:
+                threshold = getattr(self, f"{detect_type}_threshold_high")
+            params[detect_type] = {
+                "threshold": threshold,
+                "sensitivity": self.config[detect_type]['sensitivity']
             }
-        }
 
+        if not labels:
+            return
+
+        # logging.info(f"[defect_detection] request params: {params}")
         self.mqtt_jsonrpc.send_request("camera.detect_capture",
                                         params,
                                         self.response_callback)
@@ -428,7 +436,7 @@ class DefectDetection:
 
             logging.info(f"[defect_detection] response info: {respond_info}")
 
-            if self.print_stats.state != 'printing':
+            if self.print_stats is not None and self.print_stats.state != 'printing':
                 return
 
             result = respond_info.get("result", None)
@@ -709,7 +717,7 @@ class DefectDetection:
         if self.config['main_enable'] == False:
             return
 
-        if self.config['clean_bed']['enable'] == False and self.config['noodle']['enable'] == False and self.config['residue']['enable'] == False:
+        if self.config['noodle']['enable'] == False and self.config['residue']['enable'] == False:
             return
 
         if self.debug_mode == False and self.print_stats and self.print_stats.info_current_layer:
